@@ -38,6 +38,7 @@ import {
   SessionRegistry, defaultSessionsFile, defaultIpcSocket,
   type SessionRecord,
 } from './sessions'
+import { JobStore, nextFireFrom, type ScheduledJob } from './jobs'
 
 // ── State dir / files ─────────────────────────────────────────────────────
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
@@ -46,6 +47,7 @@ const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
 const PID_FILE = join(STATE_DIR, 'bot.pid')
 const SESSIONS_FILE = defaultSessionsFile(STATE_DIR)
+const JOBS_FILE = join(STATE_DIR, 'jobs.json')
 const IPC_SOCKET = defaultIpcSocket(STATE_DIR)
 // Defaults to the bash script that lives next to this file. The install
 // script also drops a symlink in ~/.local/bin so users can invoke it from
@@ -259,6 +261,9 @@ if (!STATIC) setInterval(checkApprovals, 5000).unref()
 const registry = new SessionRegistry(SESSIONS_FILE)
 registry.load()
 
+const jobs = new JobStore(JOBS_FILE)
+jobs.load()
+
 // On startup, prune sessions whose tmux session is gone. Their MCPs would
 // never reconnect, so the records are stale.
 const pruned = registry.pruneDead()
@@ -427,6 +432,99 @@ const TOPIC_SWEEP_INTERVAL_MS = 60 * 1000
 // up automatically.
 setTimeout(() => { void sweepDeletedTopics() }, 5000)
 setInterval(() => { void sweepDeletedTopics() }, TOPIC_SWEEP_INTERVAL_MS).unref()
+
+// ── Cron scheduler ───────────────────────────────────────────────────────
+// Periodically (every 60s) walks `jobs` and fires any whose nextFireAt has
+// passed. A "fire" = inject a synthetic channel notification into the
+// session for that thread (auto-spawning a session if there isn't one,
+// auto-recreating the topic via createForumTopic if the original was
+// deleted). After fire we recompute nextFireAt with croner and persist.
+async function fireJob(job: ScheduledJob): Promise<void> {
+  let { chatId, threadId, topicName, prompt } = job
+  // Recreate the topic if it was deleted between fires.
+  if (threadId) {
+    const alive = await probeTopicAlive(chatId, threadId)
+    if (!alive) {
+      try {
+        const created = await bot.api.createForumTopic(chatId, topicName)
+        threadId = created.message_thread_id
+        process.stderr.write(`telegram-dispatcher: recreated topic for job ${job.id}: ${job.threadId} → ${threadId}\n`)
+        jobs.update(job.id, { threadId })
+        await bot.api.sendMessage(chatId, '↻ Топик пересоздан — продолжаю расписание.', {
+          message_thread_id: threadId,
+        }).catch(() => {})
+      } catch (err) {
+        process.stderr.write(`telegram-dispatcher: createForumTopic failed for job ${job.id}: ${err}\n`)
+        return // try again next tick
+      }
+    }
+  }
+  // Build the synthetic inbound — meta.user="cron" so Claude can distinguish.
+  const inboundMsg = {
+    type: 'inbound' as const,
+    method: 'notifications/claude/channel',
+    params: {
+      content: `[scheduled job ${job.id}] ${prompt}`,
+      meta: {
+        chat_id: String(chatId),
+        user: 'cron',
+        user_id: 'cron',
+        ts: new Date().toISOString(),
+      },
+    },
+  }
+  const rec = registry.get(threadId)
+  if (rec?.socket) {
+    ipcSend(threadId, inboundMsg)
+  } else {
+    // No live session — queue and auto-launch (same as user-initiated
+    // auto-launch path in handleInbound).
+    queueInbound(threadId, { method: inboundMsg.method, params: inboundMsg.params })
+    if (!spawningThreads.has(threadId)) {
+      spawningThreads.add(threadId)
+      process.stderr.write(`telegram-dispatcher: auto-launching session for scheduled job ${job.id} (thread ${threadId})\n`)
+      spawnSession({ chatId, threadId, action: 'launch' })
+      startSpawnTimeout(threadId, chatId)
+    }
+  }
+}
+
+async function tickScheduler(): Promise<void> {
+  // Reload from disk so MCP-side mutations (schedule_job/cancel_job tool
+  // calls writing jobs.json) are picked up.
+  jobs.load()
+  const now = Date.now()
+  for (const job of jobs.all()) {
+    if (job.nextFireAt > now) continue
+    try {
+      await fireJob(job)
+      // Recompute next run anchored on now (skip missed catch-ups).
+      const next = nextFireFrom(job.cron, new Date(now))
+      jobs.update(job.id, { lastFireAt: now, nextFireAt: next })
+    } catch (err) {
+      process.stderr.write(`telegram-dispatcher: job ${job.id} fire failed: ${err}\n`)
+      // Postpone by one tick so we don't spin on a broken job.
+      jobs.update(job.id, { nextFireAt: now + 60_000 })
+    }
+  }
+}
+
+// On startup: any job whose stored nextFireAt is in the past (dispatcher
+// was down) gets bumped forward — standard cron behavior, no catch-up
+// thundering herd.
+;(() => {
+  const now = Date.now()
+  for (const job of jobs.all()) {
+    if (job.nextFireAt <= now) {
+      try { jobs.update(job.id, { nextFireAt: nextFireFrom(job.cron, new Date(now)) }) }
+      catch (err) { process.stderr.write(`telegram-dispatcher: failed to reset nextFireAt for ${job.id}: ${err}\n`) }
+    }
+  }
+})()
+
+const SCHEDULER_INTERVAL_MS = 60 * 1000
+setTimeout(() => { void tickScheduler() }, 10_000)
+setInterval(() => { void tickScheduler() }, SCHEDULER_INTERVAL_MS).unref()
 
 // ── IPC server: route inbound to MCP, handle MCP→dispatcher messages ──────
 function ipcSend(threadId: number, msg: object): boolean {

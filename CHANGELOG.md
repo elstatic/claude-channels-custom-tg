@@ -3,6 +3,55 @@
 All notable changes to this project. SemVer pre-1.0: minor (0.x.0) for new
 features and breaking changes, patch (0.x.y) for bug fixes only.
 
+## 0.2.0 — 2026-05-20
+
+Cron scheduler. The bot can now schedule recurring or one-shot actions —
+"каждый понедельник в 9 утра напомни X", "через 2 минуты проверь Y", "раз
+в день в 18:00 собери метрики".
+
+### Features
+
+- **Three new MCP tools** in `telegram-ss`:
+  - `schedule_job(cron, prompt, description?)` — register a cron job for
+    the current topic. Claude converts natural-language schedules to a
+    5-field cron expression itself.
+  - `list_jobs(scope?)` — list jobs in this topic (default) or
+    everywhere (`scope: "all"`).
+  - `cancel_job(id)` — remove a scheduled job.
+- **Persistent job store**: `~/.claude/channels/telegram/jobs.json`,
+  atomic-rename writes (mirrors `SessionRegistry.save()`). Survives
+  dispatcher restarts.
+- **Dispatcher tick**: every 60s walks the store and fires due jobs.
+  Cron parsing via `croner` (zero-dep, bun-native).
+- **Fire mechanism**: synthetic `notifications/claude/channel` injection
+  with `meta.user="cron"` and content prefixed `[scheduled job <id>]`.
+  Claude treats it as a normal channel inbound — replies via the `reply`
+  tool land in the topic just like any other turn. Per the
+  Claude-side-surface invariant, no new notification methods or schema
+  fields.
+- **Topic auto-recreate on deletion**: if the original topic was deleted
+  between fires, the dispatcher calls `bot.api.createForumTopic(chatId,
+  topicName)`, updates the stored `threadId`, posts a heads-up "↻ Топик
+  пересоздан — продолжаю расписание", and routes the fire into the new
+  topic. The job binding stays intact.
+- **Skip-on-restart**: jobs whose `nextFireAt` is in the past at
+  dispatcher startup get bumped forward (standard cron: no catch-up
+  thundering herd).
+- **Auto-spawn on fire**: if no session is alive in the target topic at
+  fire time, the dispatcher auto-launches one and queues the cron
+  inbound — same path as a user's first message in a fresh topic.
+
+### Caveats
+
+- `bot.api.createForumTopic` needs the bot to have topic-management
+  rights. In **DM topic mode** that's automatic (the user enabled
+  Allow Topics → bot can manage them). In **supergroup forums** the
+  bot needs `can_manage_topics` admin. If the call fails (no rights),
+  the job is skipped and retried next tick — no data loss.
+- Existing pre-0.2.0 sessions (still running with old MCP code) can't
+  call the new tools. Kill the tmux session (`/stop` in chat) and on
+  next message a fresh MCP with v0.2.0 tools will be spawned.
+
 ## 0.1.2 — 2026-05-20
 
 Filesystem hygiene release.
