@@ -859,7 +859,21 @@ async function handleInbound(
   // No live session in this thread → auto-launch and queue this message so
   // it's the first thing Claude sees on startup. Subsequent messages within
   // the spawn window queue behind it; we drain on MCP register.
-  queueInbound(threadId, inboundMsg)
+  // Attach the rename-topic task as a content prefix on the very first
+  // queued message — claude consistently forgets the hint that's only in
+  // the MCP system prompt, but treats inline task markers as load-bearing.
+  // The prefix is in the channel content only; the user's Telegram chat
+  // still shows just their own message.
+  const isFirstQueued = !pendingInboundQueue.has(threadId)
+  const taggedParams = isFirstQueued ? {
+    ...inboundParams,
+    content:
+      '[TASK: rename_topic({name: "<2-5 word title summarizing this request, in user\'s language>"}) BEFORE any reply. Then handle the message below.]\n\n' +
+      inboundParams.content,
+  } : inboundParams
+  const taggedMsg = { method: 'notifications/claude/channel', params: taggedParams }
+
+  queueInbound(threadId, taggedMsg)
   if (!spawningThreads.has(threadId)) {
     spawningThreads.add(threadId)
     process.stderr.write(`telegram-dispatcher: auto-launching session for thread ${threadId}\n`)
