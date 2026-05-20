@@ -106,7 +106,15 @@ start_session() {
     printf -v command '%s %q' "${command}" "${arg}"
   done
 
-  tmux new-session -d -s "${SESSION_NAME}" "${command}"
+  # Forward per-session env into the tmux pane. tmux strips most parent env
+  # at pane creation; -e re-injects the variables Claude's MCP needs to know
+  # which forum-topic thread it belongs to and where the dispatcher socket lives.
+  local -a tmux_env=()
+  if [[ -n "${CLAUDE_THREAD_ID:-}" ]]; then tmux_env+=(-e "CLAUDE_THREAD_ID=${CLAUDE_THREAD_ID}"); fi
+  if [[ -n "${CLAUDE_CHAT_ID:-}" ]]; then tmux_env+=(-e "CLAUDE_CHAT_ID=${CLAUDE_CHAT_ID}"); fi
+  if [[ -n "${CLAUDE_DISPATCHER_SOCK:-}" ]]; then tmux_env+=(-e "CLAUDE_DISPATCHER_SOCK=${CLAUDE_DISPATCHER_SOCK}"); fi
+
+  tmux new-session -d -s "${SESSION_NAME}" "${tmux_env[@]}" "${command}"
   confirm_dev_channels_prompt || true
   echo "started tmux session '${SESSION_NAME}' (${mode})"
 }
