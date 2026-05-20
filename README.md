@@ -30,7 +30,12 @@ systemctl --user enable --now telegram-launcher.service
 | jq         | мерж конфигурации в существующий `~/projects/.claude/settings.json`  |
 | systemd user manager | диспетчер запускается как `telegram-launcher.service`      |
 
-Плюс **в BotFather**: `/mybots → твой бот → Bot Settings → Allow Topics in Private Chats`. Без этой настройки получишь одну сессию в корне DM (как в апстрим-плагине); с настройкой — каждый топик это параллельная сессия.
+**В BotFather** (опционально): `/mybots → твой бот → Bot Settings → Allow Topics in Private Chats`.
+
+- **С включёнными топиками** (рекомендуется) — каждый топик в DM с ботом это независимая параллельная Claude-сессия, со своей историей, своим cwd, и автоматическим переименованием топика в осмысленный заголовок.
+- **Без топиков** — всё работает как обычный single-session бот: одна Claude-сессия в корне DM, `claude --continue` подцепляет её, файлы лежат в `~/claude-tg/root/`. Все остальные фичи (auto-launch на первом сообщении, typing-индикатор, live-стрим, slash-команды, авто-чистка `/tmp` и inbox) работают одинаково. Это то же поведение что в апстрим-плагине, только с нашими улучшениями.
+
+Auto-rename и multi-session — это бонус топиков. Если у тебя один основной use-case и не нужны параллельные сессии, можно ничего в BotFather не трогать.
 
 Если user-сервисы у тебя не переживают логаут: `sudo loginctl enable-linger $USER`.
 

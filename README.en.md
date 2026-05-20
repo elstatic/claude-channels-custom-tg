@@ -30,7 +30,12 @@ Install these first; the installer just checks for them:
 | jq     | merging into existing `~/projects/.claude/settings.json`       |
 | systemd user manager | the dispatcher runs as `telegram-launcher.service` |
 
-Plus, in BotFather: **`/mybots` → your bot → Bot Settings → Allow Topics in Private Chats**. Without this you only get one session in the DM root; with it, each topic is a parallel session.
+**In BotFather** (optional): `/mybots → your bot → Bot Settings → Allow Topics in Private Chats`.
+
+- **With topics enabled** (recommended) — each topic in your DM with the bot is an independent Claude session with its own history, cwd, and auto-generated title.
+- **Without topics** — works as a regular single-session bot: one Claude session at the DM root, `claude --continue` resumes it, files live in `~/claude-tg/root/`. All other features (auto-launch on first message, typing indicator, live trace stream, slash commands, `/tmp` and inbox auto-cleanup) work identically. Effectively the upstream plugin's behaviour plus our improvements.
+
+Auto-rename and multi-session are bonuses of having topics on. If you have a single main use case, leaving topics off is fine.
 
 If your user services don't survive logout: `sudo loginctl enable-linger $USER`.
 

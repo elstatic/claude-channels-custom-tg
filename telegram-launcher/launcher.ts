@@ -908,10 +908,11 @@ async function handleInbound(
   // Attach the rename-topic task as a content prefix on the very first
   // queued message — claude consistently forgets the hint that's only in
   // the MCP system prompt, but treats inline task markers as load-bearing.
-  // The prefix is in the channel content only; the user's Telegram chat
-  // still shows just their own message.
+  // Only inject when there actually is a topic to rename (threadId != 0);
+  // for a plain DM with topics disabled the marker would just trigger a
+  // no-op rename_topic call.
   const isFirstQueued = !pendingInboundQueue.has(threadId)
-  const taggedParams = isFirstQueued ? {
+  const taggedParams = (isFirstQueued && threadId !== 0) ? {
     ...inboundParams,
     content:
       '[TASK: rename_topic({name: "<2-5 word title summarizing this request, in user\'s language>"}) BEFORE any reply. Then handle the message below.]\n\n' +
