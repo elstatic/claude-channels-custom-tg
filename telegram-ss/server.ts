@@ -944,15 +944,16 @@ function handleInboundEvent(method: string, params: any): void {
   if (method === 'notifications/claude/channel/permission_more') return
 
   // Everything else (notably notifications/claude/channel) goes to Claude as-is.
-  // Auto-start typing + streaming on every user message so the user gets
-  // immediate visual feedback — "печатает…" plus the live trace draft — from
-  // the moment the message arrives, without relying on Claude to explicitly
-  // invoke start_typing. The reply tool stops both when Claude responds.
+  // Auto-start the "печатает…" indicator on every user message so feedback
+  // appears immediately. We intentionally do NOT auto-start sendMessageDraft
+  // streaming here — drafts have no disable_notification and some Telegram
+  // clients flash the unread badge on every draft tick (~1.5s), producing
+  // a "5 unread" effect even though only one logical message is in flight.
+  // Claude can opt into the live trace explicitly via start_typing.
   if (method === 'notifications/claude/channel') {
     const chat_id = (params as any)?.meta?.chat_id
     if (typeof chat_id === 'string' && chat_id.length > 0) {
       try { startTyping(chat_id) } catch {}
-      try { startStreaming(chat_id) } catch {}
     }
   }
   void mcp.notification({ method, params }).catch(err => {
