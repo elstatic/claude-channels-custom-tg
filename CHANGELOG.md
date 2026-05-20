@@ -3,6 +3,14 @@
 All notable changes to this project. SemVer pre-1.0: minor (0.x.0) for new
 features and breaking changes, patch (0.x.y) for bug fixes only.
 
+## 0.2.1 — 2026-05-20
+
+- `schedule_job` gained a `one_shot` flag. When true, the job is deleted
+  after its first fire — exactly what you want for "через 2 минуты
+  напомни" or "завтра в 18:00 проверь X". Recurring jobs (default,
+  `one_shot=false`) behave as before. Tool description and `list_jobs`
+  output both expose the field.
+
 ## 0.2.0 — 2026-05-20
 
 Cron scheduler. The bot can now schedule recurring or one-shot actions —
