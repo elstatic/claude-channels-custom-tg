@@ -329,6 +329,49 @@ function killSession(threadId: number): void {
   registry.remove(threadId)
 }
 
+// ── Topic-existence probe ─────────────────────────────────────────────────
+// Telegram doesn't emit a forum_topic_deleted event for DM-mode topics, so we
+// can't react to deletion directly. Instead we send a single-character message
+// disable_notification=true to each registered topic and immediately delete it
+// — Telegram clients usually don't render a message that's deleted within
+// ~500ms. If the send fails with "message thread not found", the topic was
+// deleted and we can clean up the corresponding tmux+Claude session.
+
+async function probeTopicAlive(chatId: number, threadId: number): Promise<boolean> {
+  if (!threadId) return true
+  try {
+    const sent = await bot.api.sendMessage(chatId, '.', {
+      message_thread_id: threadId,
+      disable_notification: true,
+    })
+    bot.api.deleteMessage(chatId, sent.message_id).catch(() => {})
+    return true
+  } catch (err) {
+    if (err instanceof GrammyError && /thread not found/i.test(err.description ?? '')) {
+      return false
+    }
+    return true
+  }
+}
+
+async function sweepDeletedTopics(): Promise<void> {
+  for (const rec of registry.all()) {
+    if (!rec.threadId) continue
+    const alive = await probeTopicAlive(rec.chatId, rec.threadId)
+    if (!alive) {
+      process.stderr.write(`telegram-dispatcher: topic ${rec.threadId} deleted, killing session\n`)
+      killSession(rec.threadId)
+    }
+  }
+}
+
+const TOPIC_SWEEP_INTERVAL_MS = 60 * 1000
+// Run an initial sweep shortly after startup (lets MCPs reconnect first), then
+// periodically. Long-tail orphans created before this code existed get cleaned
+// up automatically.
+setTimeout(() => { void sweepDeletedTopics() }, 5000)
+setInterval(() => { void sweepDeletedTopics() }, TOPIC_SWEEP_INTERVAL_MS).unref()
+
 // ── IPC server: route inbound to MCP, handle MCP→dispatcher messages ──────
 function ipcSend(threadId: number, msg: object): boolean {
   const sock = registry.socketOf(threadId)
