@@ -41,9 +41,77 @@ echo
 
 # ─── 1. Prerequisites ────────────────────────────────────────────────────
 say "Checking prerequisites"
+
+detect_pkgmgr() {
+  if command -v apt-get >/dev/null 2>&1; then echo apt
+  elif command -v dnf >/dev/null 2>&1; then echo dnf
+  elif command -v pacman >/dev/null 2>&1; then echo pacman
+  elif command -v zypper >/dev/null 2>&1; then echo zypper
+  elif command -v brew >/dev/null 2>&1; then echo brew
+  else echo unknown
+  fi
+}
+
+install_cmd_for() { # detect_pkgmgr-result, pkg-name
+  case "$1" in
+    apt)    echo "sudo apt-get update && sudo apt-get install -y $2" ;;
+    dnf)    echo "sudo dnf install -y $2" ;;
+    pacman) echo "sudo pacman -S --noconfirm $2" ;;
+    zypper) echo "sudo zypper install -y $2" ;;
+    brew)   echo "brew install $2" ;;
+    *)      echo "<install '$2' however you usually do on your distro>" ;;
+  esac
+}
+
+MISSING=()
 for cmd in bun tmux claude jq; do
-  command -v "$cmd" >/dev/null 2>&1 || die "'$cmd' not found in PATH. Install it and re-run."
+  command -v "$cmd" >/dev/null 2>&1 || MISSING+=("$cmd")
 done
+
+if (( ${#MISSING[@]} > 0 )); then
+  MGR=$(detect_pkgmgr)
+  warn "Missing: ${MISSING[*]}"
+  echo "  Suggested install steps for your distro (${MGR}):"
+  for cmd in "${MISSING[@]}"; do
+    case "$cmd" in
+      bun)    echo "    bun:    curl -fsSL https://bun.sh/install | bash   # user-level, no sudo" ;;
+      claude) echo "    claude: see https://claude.com/claude-code (install paths vary by OS)" ;;
+      *)      echo "    $cmd:    $(install_cmd_for "$MGR" "$cmd")" ;;
+    esac
+  done
+
+  if [[ -t 0 ]] && [[ "$MGR" != "unknown" ]] && ! [[ " ${MISSING[*]} " =~ " claude " ]]; then
+    echo
+    read -rp "Run these commands now? [y/N] " ans
+    if [[ "$ans" =~ ^[Yy]$ ]]; then
+      for cmd in "${MISSING[@]}"; do
+        case "$cmd" in
+          bun)
+            say "Installing bun"
+            curl -fsSL https://bun.sh/install | bash
+            # Re-export PATH so the rest of the script sees bun
+            [[ -d "$HOME/.bun/bin" ]] && export PATH="$HOME/.bun/bin:$PATH"
+            ;;
+          *)
+            say "Installing $cmd via $MGR (you may be prompted for sudo password)"
+            # shellcheck disable=SC2086
+            bash -c "$(install_cmd_for "$MGR" "$cmd")"
+            ;;
+        esac
+      done
+      # Re-check
+      for cmd in "${MISSING[@]}"; do
+        command -v "$cmd" >/dev/null 2>&1 || die "$cmd still missing after attempted install. Aborting."
+      done
+      ok "Missing tools installed."
+    else
+      die "Install the missing tools above and re-run ./install.sh"
+    fi
+  else
+    die "Install the missing tools above and re-run ./install.sh"
+  fi
+fi
+
 ok "bun, tmux, claude, jq present"
 BUN_BIN="$(command -v bun)"
 CLAUDE_BIN="$(command -v claude)"
