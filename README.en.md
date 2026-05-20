@@ -1,5 +1,7 @@
 # claude-channels-custom-tg
 
+> *Читай на [русском](./README.md)*
+
 Run multiple parallel **Claude Code sessions over one Telegram bot**, with each session living in its own forum topic. The first message in a new topic auto-spawns a Claude session; deleted topics are detected and cleaned up; the bot lives as a systemd user service.
 
 This is a heavily customized fork of the official [`telegram@claude-plugins-official`](https://github.com/anthropics/claude-code/tree/main/plugins) channel plugin, plus a separate dispatcher daemon that handles all the cross-session plumbing.
