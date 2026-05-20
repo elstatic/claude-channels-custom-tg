@@ -3,6 +3,56 @@
 All notable changes to this project. SemVer pre-1.0: minor (0.x.0) for new
 features and breaking changes, patch (0.x.y) for bug fixes only.
 
+## 0.1.1 — 2026-05-20
+
+Bug-fix patch on top of 0.1.0, all problems found while dogfooding.
+
+### Fixes
+
+- **File uploads through HTTP_PROXY**: `reply` with attachments hung 62s and
+  failed with "Network request for 'sendDocument' failed!" because grammy's
+  `InputFile` streams the multipart body through Node `https.Agent`, which
+  bun + proxy choke on. We bypass grammy for the file path now and post a
+  plain `FormData`+`fetch` to `/sendDocument` / `/sendPhoto` — completes in
+  <1s through the same proxy.
+- **Edit-based live trace** (was: `sendMessageDraft`): drafts have no
+  `disable_notification`; some Telegram clients raised the unread badge on
+  every ~1.5s tick, producing a "5 unread" effect for a single in-flight
+  turn. Switched to `sendMessage` + `editMessageText` (openclaw-style) — one
+  unread for the first content, edits silent thereafter. Trace message is
+  deleted on `stopStreaming` so chat history stays clean.
+- **MCP auto-starts streaming on inbound**: was opt-in via `start_typing`,
+  meaning follow-up messages got typing but no trace. Re-enabled the
+  auto-start now that drafts are gone.
+- **Deferred tool loading dropping `reply`**: Claude Code 2.x defaults to
+  tool-search ON, which marks all MCP tools as deferred and excludes
+  unreferenced ones from the model context. After a few short turns the
+  model would forget about the `reply` tool, render its response in the
+  TUI only, and silently drop the message — until the user pinged again
+  and re-discovered the tool. Pinned `ENABLE_TOOL_SEARCH=false` in
+  `claude-channels-tmux` so every spawned session keeps reply available.
+- **Per-thread `--debug-file`**: parallel sessions were sharing
+  `/tmp/claude-spawn.log` and clobbering each other (claude truncates the
+  file on each session start). Now `/tmp/claude-spawn-t<thread>.log`.
+- **`HTTP_PROXY` survives tmux pane spawn**: tmux strips most env vars at
+  pane creation; we now explicitly `-e` forward the proxy vars too.
+
+### Setup
+
+- **install.sh**: optional auto-install of missing prereqs.  Detects
+  apt/dnf/pacman/zypper/brew, prints distro-appropriate commands, and (in
+  interactive mode) prompts to run them. `bun` via the official user-level
+  curl|bash, `tmux`/`jq` via the system package manager with `sudo`.
+- **Russian README is now primary** at `README.md`; English moved to
+  `README.en.md` with reciprocal links. Default GitHub view is Russian now.
+
+### Internal
+
+- launcher.ts `LAUNCHER_BIN` default switched from a `/home/clawd/...`
+  hardcode to `import.meta.dir + '/claude-channels-tmux'`. The install
+  script's symlink in `$BIN_DIR` remains the canonical way to invoke from
+  outside, but the dispatcher now finds its sibling script reliably.
+
 ## 0.1.0 — 2026-05-20
 
 First taggable release. Forked from `telegram@claude-plugins-official` and
