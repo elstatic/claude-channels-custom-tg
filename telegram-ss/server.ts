@@ -635,20 +635,33 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         }
 
         // Files go as separate messages (Telegram doesn't mix text+file in one
-        // sendMessage call). Thread under reply_to if present.
+        // sendMessage call). We bypass grammy's InputFile here because it
+        // streams the body via Node's https.Agent, which under bun+HTTP_PROXY
+        // (the common case on a russian-locked-out server tunneling through
+        // a SOCKS/HTTP proxy) ends up timing out after ~62s on multipart.
+        // A direct FormData+fetch hits the proxy correctly in <1s. We still
+        // honor message_thread_id (auto-injected on JSON sends elsewhere by
+        // the bot.api transformer; for raw fetch we add it explicitly).
         for (const f of files) {
           const ext = extname(f).toLowerCase()
-          const input = new InputFile(f)
-          const opts = reply_to != null && replyMode !== 'off'
-            ? { reply_parameters: { message_id: reply_to } }
-            : undefined
-          if (PHOTO_EXTS.has(ext)) {
-            const sent = await bot.api.sendPhoto(chat_id, input, opts)
-            sentIds.push(sent.message_id)
-          } else {
-            const sent = await bot.api.sendDocument(chat_id, input, opts)
-            sentIds.push(sent.message_id)
+          const method = PHOTO_EXTS.has(ext) ? 'sendPhoto' : 'sendDocument'
+          const field  = PHOTO_EXTS.has(ext) ? 'photo'      : 'document'
+          const fd = new FormData()
+          fd.set('chat_id', chat_id)
+          if (THREAD_ID) fd.set('message_thread_id', String(THREAD_ID))
+          if (reply_to != null && replyMode !== 'off') {
+            fd.set('reply_parameters', JSON.stringify({ message_id: reply_to }))
           }
+          const bytes = await Bun.file(f).arrayBuffer()
+          const name = f.split('/').pop() || 'file'
+          fd.set(field, new Blob([bytes]), name)
+          const url = `https://api.telegram.org/bot${TOKEN}/${method}`
+          const res = await fetch(url, { method: 'POST', body: fd, signal: AbortSignal.timeout(120_000) })
+          const json = await res.json() as { ok: boolean; result?: { message_id: number }; description?: string }
+          if (!json.ok || !json.result) {
+            throw new Error(`${method} failed: ${json.description ?? res.statusText}`)
+          }
+          sentIds.push(json.result.message_id)
         }
 
         const result =
