@@ -47,7 +47,11 @@ const APPROVED_DIR = join(STATE_DIR, 'approved')
 const PID_FILE = join(STATE_DIR, 'bot.pid')
 const SESSIONS_FILE = defaultSessionsFile(STATE_DIR)
 const IPC_SOCKET = defaultIpcSocket(STATE_DIR)
-const LAUNCHER_BIN = process.env.CLAUDE_LAUNCHER_BIN ?? '/home/clawd/.openclaw/workspace/bin/claude-channels-tmux'
+// Defaults to the bash script that lives next to this file. The install
+// script also drops a symlink in ~/.local/bin so users can invoke it from
+// anywhere; override CLAUDE_LAUNCHER_BIN if you keep the script elsewhere.
+const LAUNCHER_BIN = process.env.CLAUDE_LAUNCHER_BIN
+  ?? join(import.meta.dir, 'claude-channels-tmux')
 
 // ── .env loader ───────────────────────────────────────────────────────────
 try {

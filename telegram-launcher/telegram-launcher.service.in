@@ -1,0 +1,19 @@
+[Unit]
+Description=Telegram dispatcher for Claude Code sessions
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=@BUN@ run @LAUNCHER@
+WorkingDirectory=@WORKDIR@
+Restart=always
+RestartSec=5
+TimeoutStopSec=10
+StandardOutput=journal
+StandardError=journal
+# KillMode=process so the dispatcher's spawned tmux+Claude sessions survive
+# our restart/stop. Cgroup-killing would SIGTERM them ~1s after our exit.
+KillMode=process
+
+[Install]
+WantedBy=default.target

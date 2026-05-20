@@ -1,6 +1,6 @@
 {
-  "name": "claude-channel-telegram",
-  "version": "0.0.1",
+  "name": "claude-channels-custom-tg-mcp",
+  "version": "0.1.0",
   "license": "Apache-2.0",
   "type": "module",
   "bin": "./server.ts",
