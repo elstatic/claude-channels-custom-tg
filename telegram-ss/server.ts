@@ -931,6 +931,17 @@ function handleInboundEvent(method: string, params: any): void {
   if (method === 'notifications/claude/channel/permission_more') return
 
   // Everything else (notably notifications/claude/channel) goes to Claude as-is.
+  // Auto-start typing + streaming on every user message so the user gets
+  // immediate visual feedback — "печатает…" plus the live trace draft — from
+  // the moment the message arrives, without relying on Claude to explicitly
+  // invoke start_typing. The reply tool stops both when Claude responds.
+  if (method === 'notifications/claude/channel') {
+    const chat_id = (params as any)?.meta?.chat_id
+    if (typeof chat_id === 'string' && chat_id.length > 0) {
+      try { startTyping(chat_id) } catch {}
+      try { startStreaming(chat_id) } catch {}
+    }
+  }
   void mcp.notification({ method, params }).catch(err => {
     process.stderr.write(`telegram-ss: failed to deliver inbound to Claude: ${err}\n`)
   })
