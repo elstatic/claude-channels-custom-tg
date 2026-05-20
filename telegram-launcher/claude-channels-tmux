@@ -36,7 +36,13 @@ build_claude_cmd() {
   else
     cmd+=(--channels "${CHANNEL_SPEC}")
   fi
-  cmd+=(--dangerously-skip-permissions --debug-file /tmp/claude-spawn.log)
+  # Per-thread debug-file so parallel sessions don't clobber each other's
+  # logs (claude-code opens the file in truncate mode each session).
+  local debug_log="/tmp/claude-spawn.log"
+  if [[ -n "${CLAUDE_THREAD_ID:-}" && "${CLAUDE_THREAD_ID}" != "0" ]]; then
+    debug_log="/tmp/claude-spawn-t${CLAUDE_THREAD_ID}.log"
+  fi
+  cmd+=(--dangerously-skip-permissions --debug-file "${debug_log}")
   printf '%s\n' "${cmd[@]}"
 }
 
