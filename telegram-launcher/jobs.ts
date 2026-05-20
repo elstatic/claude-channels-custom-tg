@@ -14,6 +14,7 @@ export type ScheduledJob = {
   cron: string           // cron expression, e.g. "0 9 * * MON"
   prompt: string         // injected as channel notification content
   description?: string   // human-readable
+  oneShot?: boolean      // true → delete after first fire (one-time reminders)
   createdAt: number
   lastFireAt?: number
   nextFireAt: number     // pre-computed, persisted to survive restart

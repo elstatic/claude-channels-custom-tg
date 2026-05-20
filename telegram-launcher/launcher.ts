@@ -498,9 +498,14 @@ async function tickScheduler(): Promise<void> {
     if (job.nextFireAt > now) continue
     try {
       await fireJob(job)
-      // Recompute next run anchored on now (skip missed catch-ups).
-      const next = nextFireFrom(job.cron, new Date(now))
-      jobs.update(job.id, { lastFireAt: now, nextFireAt: next })
+      if (job.oneShot) {
+        jobs.remove(job.id)
+        process.stderr.write(`telegram-dispatcher: one-shot job ${job.id} fired and removed\n`)
+      } else {
+        // Recompute next run anchored on now (skip missed catch-ups).
+        const next = nextFireFrom(job.cron, new Date(now))
+        jobs.update(job.id, { lastFireAt: now, nextFireAt: next })
+      }
     } catch (err) {
       process.stderr.write(`telegram-dispatcher: job ${job.id} fire failed: ${err}\n`)
       // Postpone by one tick so we don't spin on a broken job.

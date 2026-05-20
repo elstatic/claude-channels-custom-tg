@@ -631,12 +631,13 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'schedule_job',
       description:
-        "Schedule a recurring/scheduled action. The dispatcher will fire the prompt back into this topic at every cron-matched time and you'll handle it like a normal user message (your reply via the reply tool reaches the user). Use this whenever the user asks for time-based behavior — 'каждый понедельник в 9', 'раз в день', 'через 2 минуты напомни', etc. Convert the natural-language schedule to a 5-field cron expression yourself. If the original topic is deleted between fires, the dispatcher recreates it under the same name and continues — no manual rebinding needed. Returns {id, cron, prompt, nextFireAt} on success.",
+        "Schedule a one-time OR recurring action. The dispatcher will fire the prompt back into this topic at each cron-matched moment and you'll handle it like a normal user message (your reply via the reply tool reaches the user). Use whenever the user asks for time-based behavior — 'каждый понедельник в 9' (recurring), 'через 2 минуты напомни' (one_shot=true), 'завтра в 18:00 проверь Y' (one_shot=true). Convert the natural-language schedule to a 5-field cron expression yourself. For one-time tasks at a specific moment, pick a cron that matches only that moment (e.g. '30 14 21 5 *' for 14:30 on May 21) AND pass one_shot=true so the job auto-deletes after firing. If the original topic is deleted between fires, the dispatcher recreates it under the same name and continues — no manual rebinding needed. Returns {id, cron, prompt, nextFireAt, oneShot} on success.",
       inputSchema: {
         type: 'object',
         properties: {
-          cron: { type: 'string', description: '5-field cron expression, e.g. "0 9 * * MON" (every Mon at 9 AM), "*/15 * * * *" (every 15 min). One-shot reminders: pick the absolute next-occurrence cron (e.g. "30 14 20 5 *" for 14:30 on May 20).' },
+          cron: { type: 'string', description: '5-field cron expression. Examples: "0 9 * * MON" (every Mon at 9 AM), "*/15 * * * *" (every 15 min), "30 14 21 5 *" (14:30 on May 21).' },
           prompt: { type: 'string', description: 'What to inject as the synthetic message when the job fires. Phrase it as you\'d want to see it — e.g. "Напомни про чай" or "Проверь PR-ы в репо X". You\'ll see it prefixed with "[scheduled job <id>]".' },
+          one_shot: { type: 'boolean', description: 'If true, the job auto-deletes after firing once. Use this for one-time reminders ("завтра в 18:00", "через 5 минут"). Default false (recurring).' },
           description: { type: 'string', description: 'Optional short description shown in list_jobs.' },
         },
         required: ['cron', 'prompt'],
@@ -911,24 +912,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       case 'schedule_job': {
         const cron = String(args.cron ?? '').trim()
         const prompt = String(args.prompt ?? '').trim()
+        const oneShot = args.one_shot === true
         const description = args.description != null ? String(args.description).trim() || undefined : undefined
         if (!cron) throw new Error('cron is required')
         if (!prompt) throw new Error('prompt is required')
         if (CHAT_ID_FROM_ENV == null) throw new Error('CLAUDE_CHAT_ID not set')
         // Validate cron, compute first fire.
         const nextFireAt = nextFireFrom(cron)
-        // Read existing topic name from the current Telegram topic if any —
-        // we'll need it to recreate after a deletion. Best-effort fallback
-        // to "Claude scheduled" if we can't query.
-        let topicName = 'Claude scheduled'
-        if (THREAD_ID) {
-          try {
-            // No direct getForumTopic in Bot API; we infer the name later
-            // from createForumTopic-time history. Caller can pass override
-            // via description if they like — for now use a placeholder.
-            topicName = description || `job ${cron}`
-          } catch { /* placeholder fine */ }
-        }
+        // We don't have a direct getForumTopic API to read the current name,
+        // so we use description or a derived label for recreate-after-delete.
+        const topicName = description || `job ${cron}`
         const store = new JobStore(JOBS_FILE)
         store.load()
         const job = store.add({
@@ -938,6 +931,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           cron,
           prompt,
           description,
+          oneShot,
           nextFireAt,
         })
         return {
@@ -945,6 +939,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             id: job.id,
             cron: job.cron,
             prompt: job.prompt,
+            oneShot: job.oneShot ?? false,
             nextFireAt: new Date(job.nextFireAt).toISOString(),
           }, null, 2) }],
         }
@@ -959,6 +954,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           cron: j.cron,
           prompt: j.prompt,
           description: j.description,
+          oneShot: j.oneShot ?? false,
           threadId: j.threadId,
           lastFireAt: j.lastFireAt ? new Date(j.lastFireAt).toISOString() : null,
           nextFireAt: new Date(j.nextFireAt).toISOString(),
