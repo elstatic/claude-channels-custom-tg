@@ -362,6 +362,9 @@ createIpcServer({
         pendingAcks.delete(thread_id)
         bot.api.editMessageText(ack.chatId, ack.messageId, ack.label).catch(() => {})
       }
+      // Flush any auto-launch queued inbound — messages that arrived before
+      // the MCP was ready get delivered now in order.
+      drainQueue(thread_id)
       return
     }
     if (msg.type === 'permission_reply' || msg.type === 'outbound_dialog') {
@@ -388,6 +391,38 @@ process.stderr.write(`telegram-dispatcher: IPC server listening at ${IPC_SOCKET}
 
 // Launch-ack tracking: thread_id → message to edit when MCP registers.
 const pendingAcks = new Map<number, { chatId: number; messageId: number; label: string }>()
+
+// Auto-launch state: messages that arrived before a session was up. Drained
+// to the socket on MCP register. Per-thread queue + per-thread "spawning"
+// guard so a burst of messages doesn't fire multiple `claude-channels-tmux`.
+const pendingInboundQueue = new Map<number, Array<{ method: string; params: any }>>()
+const spawningThreads = new Set<number>()
+const SPAWN_TIMEOUT_MS = 60_000
+
+function queueInbound(threadId: number, msg: { method: string; params: any }): void {
+  let arr = pendingInboundQueue.get(threadId)
+  if (!arr) { arr = []; pendingInboundQueue.set(threadId, arr) }
+  arr.push(msg)
+}
+
+function drainQueue(threadId: number): void {
+  const queue = pendingInboundQueue.get(threadId)
+  if (!queue) return
+  pendingInboundQueue.delete(threadId)
+  spawningThreads.delete(threadId)
+  for (const msg of queue) ipcSend(threadId, { type: 'inbound', method: msg.method, params: msg.params })
+}
+
+function startSpawnTimeout(threadId: number, chatId: number): void {
+  setTimeout(() => {
+    if (!spawningThreads.has(threadId)) return
+    spawningThreads.delete(threadId)
+    pendingInboundQueue.delete(threadId)
+    bot.api.sendMessage(chatId, '⚠ Не удалось запустить Claude (таймаут). Тапни кнопку чтобы попробовать ещё раз.', {
+      message_thread_id: threadId || undefined, reply_markup: sessionMenu(),
+    }).catch(() => {})
+  }, SPAWN_TIMEOUT_MS)
+}
 
 function notifySessionEnded(rec: SessionRecord): void {
   bot.api.sendMessage(rec.chatId, 'Claude остановился. Что сделать?', {
@@ -690,16 +725,6 @@ async function handleInbound(
     return
   }
 
-  // No session in this thread → offer launch/continue.
-  const rec = registry.get(threadId)
-  if (!rec || !rec.socket) {
-    await bot.api.sendMessage(chatId, 'Claude не запущен. Что сделать?', {
-      message_thread_id: threadId || undefined,
-      reply_markup: sessionMenu(),
-    }).catch(() => {})
-    return
-  }
-
   // Ack reaction (configurable).
   if (access.ackReaction && msgId != null) {
     void bot.api.setMessageReaction(chat_id, msgId, [
@@ -709,31 +734,50 @@ async function handleInbound(
 
   const imagePath = downloadImage ? await downloadImage() : undefined
 
-  // Forward to MCP as a channel notification — payload shape identical to
-  // what the old in-process MCP used to construct itself. Claude's view
-  // unchanged: <channel source="telegram" chat_id="..." …>.
-  ipcSend(threadId, {
-    type: 'inbound',
-    method: 'notifications/claude/channel',
-    params: {
-      content: text,
-      meta: {
-        chat_id,
-        ...(msgId != null ? { message_id: String(msgId) } : {}),
-        user: from.username ?? String(from.id),
-        user_id: String(from.id),
-        ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
-        ...(imagePath ? { image_path: imagePath } : {}),
-        ...(attachment ? {
-          attachment_kind: attachment.kind,
-          attachment_file_id: attachment.file_id,
-          ...(attachment.size != null ? { attachment_size: String(attachment.size) } : {}),
-          ...(attachment.mime ? { attachment_mime: attachment.mime } : {}),
-          ...(attachment.name ? { attachment_name: attachment.name } : {}),
-        } : {}),
-      },
+  // Build the channel notification payload. Same shape as the old in-process
+  // MCP used — Claude's view unchanged.
+  const inboundParams = {
+    content: text,
+    meta: {
+      chat_id,
+      ...(msgId != null ? { message_id: String(msgId) } : {}),
+      user: from.username ?? String(from.id),
+      user_id: String(from.id),
+      ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
+      ...(imagePath ? { image_path: imagePath } : {}),
+      ...(attachment ? {
+        attachment_kind: attachment.kind,
+        attachment_file_id: attachment.file_id,
+        ...(attachment.size != null ? { attachment_size: String(attachment.size) } : {}),
+        ...(attachment.mime ? { attachment_mime: attachment.mime } : {}),
+        ...(attachment.name ? { attachment_name: attachment.name } : {}),
+      } : {}),
     },
-  })
+  }
+  const inboundMsg = { method: 'notifications/claude/channel', params: inboundParams }
+
+  const rec = registry.get(threadId)
+  if (rec?.socket) {
+    ipcSend(threadId, { type: 'inbound', ...inboundMsg })
+    return
+  }
+
+  // No live session in this thread → auto-launch and queue this message so
+  // it's the first thing Claude sees on startup. Subsequent messages within
+  // the spawn window queue behind it; we drain on MCP register.
+  queueInbound(threadId, inboundMsg)
+  if (!spawningThreads.has(threadId)) {
+    spawningThreads.add(threadId)
+    process.stderr.write(`telegram-dispatcher: auto-launching session for thread ${threadId}\n`)
+    spawnSession({ chatId, threadId, action: 'launch' })
+    startSpawnTimeout(threadId, chatId)
+    // Signal "we got your message, hang on" — sendChatAction shows the
+    // "typing…" indicator above the chat. The MCP will pick this up itself
+    // once it starts streaming its draft response.
+    void bot.api.sendChatAction(chat_id, 'typing', {
+      message_thread_id: threadId || undefined,
+    } as any).catch(() => {})
+  }
 }
 
 // ── message:* wiring ──────────────────────────────────────────────────────
