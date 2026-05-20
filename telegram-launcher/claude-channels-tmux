@@ -115,7 +115,15 @@ start_session() {
   # Forward per-session env into the tmux pane. tmux strips most parent env
   # at pane creation; -e re-injects the variables Claude's MCP needs to know
   # which forum-topic thread it belongs to and where the dispatcher socket lives.
-  local -a tmux_env=()
+  #
+  # ENABLE_TOOL_SEARCH=false: Claude Code 2.x defaults to tool-search ON,
+  # which marks ALL MCP tools as `deferred` and only includes them in the
+  # model context when "discovered" in recent message history. For our
+  # Telegram channel that means after a few short turns the `reply` tool
+  # silently drops out — Claude then renders its response in the TUI only
+  # and the user never sees it. Pinning the feature off keeps reply always
+  # available.
+  local -a tmux_env=(-e "ENABLE_TOOL_SEARCH=false")
   if [[ -n "${CLAUDE_THREAD_ID:-}" ]]; then tmux_env+=(-e "CLAUDE_THREAD_ID=${CLAUDE_THREAD_ID}"); fi
   if [[ -n "${CLAUDE_CHAT_ID:-}" ]]; then tmux_env+=(-e "CLAUDE_CHAT_ID=${CLAUDE_CHAT_ID}"); fi
   if [[ -n "${CLAUDE_DISPATCHER_SOCK:-}" ]]; then tmux_env+=(-e "CLAUDE_DISPATCHER_SOCK=${CLAUDE_DISPATCHER_SOCK}"); fi
