@@ -1039,19 +1039,25 @@ let ipcClient: ReturnType<typeof connectToIpc> | null = null
 // as inline buttons in this session's topic. Lives here (not in dispatcher)
 // because parseDialog reads the pane this MCP shares with claude.
 async function watchForDialogLocal(): Promise<void> {
-  await new Promise(r => setTimeout(r, 700))
-  const pane = capturePaneText()
-  if (!pane) return
-  const dlg = parseDialog(pane)
-  if (!dlg) return
-  const kbd = new InlineKeyboard()
-  for (const opt of dlg.options) {
-    const label = opt.label.length > 60 ? opt.label.slice(0, 57) + '…' : opt.label
-    kbd.text(label, `tuidlg:${opt.idx}`).row()
+  // Poll the pane for up to ~8 seconds. /model and /resume open pickers
+  // after claude reinitializes its MCP connections, which can take a couple
+  // seconds. A single 700ms snapshot can miss the picker entirely.
+  for (let i = 0; i < 16; i++) {
+    await new Promise(r => setTimeout(r, 500))
+    const pane = capturePaneText()
+    if (!pane) continue
+    const dlg = parseDialog(pane)
+    if (!dlg) continue
+    const kbd = new InlineKeyboard()
+    for (const opt of dlg.options) {
+      const label = opt.label.length > 60 ? opt.label.slice(0, 57) + '…' : opt.label
+      kbd.text(label, `tuidlg:${opt.idx}`).row()
+    }
+    const chat_id = CHAT_ID_FROM_ENV
+    if (chat_id == null) return
+    await bot.api.sendMessage(chat_id, dlg.question, { reply_markup: kbd }).catch(() => {})
+    return
   }
-  const chat_id = CHAT_ID_FROM_ENV
-  if (chat_id == null) return
-  await bot.api.sendMessage(chat_id, dlg.question, { reply_markup: kbd }).catch(() => {})
 }
 
 function handleTuiSend(mode: 'slash' | 'keys', payload: string | string[]): void {

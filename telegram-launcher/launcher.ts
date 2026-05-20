@@ -541,11 +541,33 @@ setTimeout(() => { void tickScheduler() }, 10_000)
 setInterval(() => { void tickScheduler() }, SCHEDULER_INTERVAL_MS).unref()
 
 // ── IPC server: route inbound to MCP, handle MCP→dispatcher messages ──────
+// Outbound RPC messages we couldn't deliver because the MCP socket was
+// momentarily down (e.g. claude /model picker triggers a short reconnect
+// cycle). Flushed on register. Per-thread queue, capped to avoid runaway.
+const pendingOutbound = new Map<number, object[]>()
+const MAX_PENDING_OUTBOUND = 32
+
 function ipcSend(threadId: number, msg: object): boolean {
   const sock = registry.socketOf(threadId)
-  if (!sock || sock.destroyed) return false
-  sendJson(sock, msg)
-  return true
+  if (sock && !sock.destroyed) {
+    sendJson(sock, msg)
+    return true
+  }
+  // Buffer for the upcoming reconnect — only useful for short drops.
+  let q = pendingOutbound.get(threadId)
+  if (!q) { q = []; pendingOutbound.set(threadId, q) }
+  if (q.length < MAX_PENDING_OUTBOUND) q.push(msg)
+  return false
+}
+
+function flushPendingOutbound(threadId: number): void {
+  const q = pendingOutbound.get(threadId)
+  if (!q || q.length === 0) return
+  pendingOutbound.delete(threadId)
+  const sock = registry.socketOf(threadId)
+  if (!sock || sock.destroyed) return
+  for (const msg of q) sendJson(sock, msg)
+  process.stderr.write(`telegram-dispatcher: flushed ${q.length} buffered outbound for thread=${threadId}\n`)
 }
 
 createIpcServer({
@@ -586,6 +608,9 @@ createIpcServer({
       // (the MCP `register` event fires on socket connect, but Claude's
       // capability subscription completes ~50-200ms after mcp.connect).
       setTimeout(() => drainQueue(thread_id), 800)
+      // Flush any tui_send/watch_dialog that arrived while the socket was
+      // down (e.g. between a /model-triggered drop and reconnect).
+      flushPendingOutbound(thread_id)
       return
     }
     if (msg.type === 'permission_reply' || msg.type === 'outbound_dialog') {
