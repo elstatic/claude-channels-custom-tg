@@ -10,7 +10,18 @@ case ":${PATH}:" in
 esac
 export PATH
 
-PROJECTS_DIR="${CLAUDE_PROJECTS_DIR:-$HOME/projects}"
+# Per-session cwd. Each topic gets its own dir under TOPIC_ROOT so files
+# don't intermix, `claude --continue` resolves to *this topic's* history,
+# and a topic deletion can cleanly archive/drop just that subtree. The
+# root DM (no topic, thread_id=0) gets TOPIC_ROOT/root/.
+TOPIC_ROOT="${CLAUDE_TOPIC_ROOT:-$HOME/claude-tg}"
+if [[ -n "${CLAUDE_PROJECTS_DIR:-}" ]]; then
+  PROJECTS_DIR="${CLAUDE_PROJECTS_DIR}"  # explicit override wins
+elif [[ -n "${CLAUDE_THREAD_ID:-}" && "${CLAUDE_THREAD_ID}" != "0" ]]; then
+  PROJECTS_DIR="${TOPIC_ROOT}/topic-${CLAUDE_THREAD_ID}"
+else
+  PROJECTS_DIR="${TOPIC_ROOT}/root"
+fi
 CHANNEL_SPEC="${CLAUDE_CHANNEL_SPEC:-server:telegram-ss}"
 SESSION_NAME="${CLAUDE_TMUX_SESSION:-claude_${CHANNEL_SPEC//[^[:alnum:]]/_}}"
 
@@ -97,6 +108,11 @@ start_session() {
   fi
 
   mkdir -p "${PROJECTS_DIR}"
+  # Each per-topic dir needs its own .claude with the MCP config. We symlink
+  # to a shared TOPIC_ROOT/.claude so MCP/skills/agents are configured once.
+  if [[ ! -e "${PROJECTS_DIR}/.claude" ]] && [[ -d "${TOPIC_ROOT}/.claude" ]]; then
+    ln -s "${TOPIC_ROOT}/.claude" "${PROJECTS_DIR}/.claude" 2>/dev/null || true
+  fi
 
   local -a cmd=()
   while IFS= read -r line; do

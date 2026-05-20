@@ -3,6 +3,48 @@
 All notable changes to this project. SemVer pre-1.0: minor (0.x.0) for new
 features and breaking changes, patch (0.x.y) for bug fixes only.
 
+## 0.1.2 — 2026-05-20
+
+Filesystem hygiene release.
+
+### Features
+
+- **Per-topic working directory**: each forum-topic session now runs in
+  `~/claude-tg/topic-<id>/` (root DM in `~/claude-tg/root/`) instead of a
+  shared `~/projects/`. Side benefits:
+  - Files from different topics no longer intermix.
+  - `claude --continue` correctly resumes *this topic's* history because
+    Claude's per-cwd session storage now isolates topics naturally.
+  - On topic delete, the entire subtree can be archived/dropped without
+    affecting other sessions.
+  Override via `CLAUDE_TOPIC_ROOT` env var; spawn-time symlinks each
+  per-topic `.claude` to the shared `~/claude-tg/.claude` so MCP +
+  skills config stays single-source-of-truth.
+- **Disk hygiene sweep** in dispatcher: hourly cleanup of
+  `/tmp/claude-spawn*.log` older than `CLAUDE_LOG_TTL_DAYS` (default 7) and
+  `~/.claude/channels/telegram/inbox/*` older than `CLAUDE_INBOX_TTL_DAYS`
+  (default 30). Initial run 30s after start so the dispatcher doesn't
+  block on it.
+- **Rename-topic enforcement on first message**: the dispatcher now
+  prepends `[TASK: rename_topic(...) BEFORE any reply]` to the content of
+  the first message in a fresh topic, and the MCP system prompt opens
+  with a HARD RULE telling Claude to obey the marker. Claude was
+  consistently forgetting the upstream-style "auto-title" hint when it
+  was buried in the middle of a long instructions block.
+- **Filesystem hygiene hint in MCP system prompt**: tells Claude to keep
+  project artifacts in cwd, use `/tmp` for ephemerals, and stay out of
+  `~/` root / `~/.claude/`. Defense in depth — Claude usually does the
+  right thing already, but the hint catches the edge cases.
+
+### Setup
+
+- **install.sh updated**: writes MCP config to `$TOPIC_ROOT/.claude/`
+  (default `~/claude-tg/.claude/`) instead of `$PROJECTS_DIR/.claude/`.
+  Pre-creates `~/claude-tg/root/` and its `.claude` symlink. Existing
+  installs from 0.1.x can re-run; the old `~/projects/.claude/settings.json`
+  is left in place untouched (you can delete it manually if you don't
+  use `~/projects` for anything else).
+
 ## 0.1.1 — 2026-05-20
 
 Bug-fix patch on top of 0.1.0, all problems found while dogfooding.

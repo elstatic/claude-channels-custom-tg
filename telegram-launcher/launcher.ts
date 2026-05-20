@@ -23,7 +23,7 @@ import { Bot, GrammyError, InlineKeyboard, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { spawn, spawnSync } from 'child_process'
 import {
-  readFileSync, writeFileSync, mkdirSync, chmodSync, renameSync, readdirSync, rmSync,
+  readFileSync, writeFileSync, mkdirSync, chmodSync, renameSync, readdirSync, rmSync, statSync,
 } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
@@ -357,6 +357,52 @@ async function probeTopicAlive(chatId: number, threadId: number): Promise<boolea
     return true
   }
 }
+
+// ── Disk hygiene: TTL on debug logs and inbox attachments ────────────────
+// Without this the server slowly fills with old per-thread claude-spawn
+// logs and downloaded voice/photo attachments. Two configurable TTLs:
+//   CLAUDE_LOG_TTL_DAYS      (default 7)  — /tmp/claude-spawn-t*.log
+//   CLAUDE_INBOX_TTL_DAYS    (default 30) — ~/.claude/channels/telegram/inbox/*
+const LOG_TTL_MS   = (parseInt(process.env.CLAUDE_LOG_TTL_DAYS ?? '7',  10) || 7)  * 86400_000
+const INBOX_TTL_MS = (parseInt(process.env.CLAUDE_INBOX_TTL_DAYS ?? '30', 10) || 30) * 86400_000
+const INBOX_DIR_HYGIENE = join(STATE_DIR, 'inbox')
+
+async function sweepDiskHygiene(): Promise<void> {
+  const now = Date.now()
+  // /tmp/claude-spawn-t*.log
+  try {
+    const entries = readdirSync('/tmp')
+    for (const name of entries) {
+      if (!/^claude-spawn(-t\d+)?\.log$/.test(name)) continue
+      const path = '/tmp/' + name
+      try {
+        const st = statSync(path)
+        if (now - st.mtimeMs > LOG_TTL_MS) {
+          rmSync(path, { force: true })
+          process.stderr.write(`telegram-dispatcher: pruned old log ${path}\n`)
+        }
+      } catch {}
+    }
+  } catch {}
+  // Inbox attachments
+  try {
+    const entries = readdirSync(INBOX_DIR_HYGIENE)
+    for (const name of entries) {
+      const path = join(INBOX_DIR_HYGIENE, name)
+      try {
+        const st = statSync(path)
+        if (now - st.mtimeMs > INBOX_TTL_MS) {
+          rmSync(path, { force: true })
+          process.stderr.write(`telegram-dispatcher: pruned old inbox ${path}\n`)
+        }
+      } catch {}
+    }
+  } catch {}
+}
+
+const HYGIENE_INTERVAL_MS = 60 * 60 * 1000
+setTimeout(() => { void sweepDiskHygiene() }, 30_000)
+setInterval(() => { void sweepDiskHygiene() }, HYGIENE_INTERVAL_MS).unref()
 
 async function sweepDeletedTopics(): Promise<void> {
   for (const rec of registry.all()) {

@@ -20,7 +20,7 @@
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECTS_DIR="${PROJECTS_DIR:-$HOME/projects}"
+TOPIC_ROOT="${TOPIC_ROOT:-$HOME/claude-tg}"
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
 STATE_DIR="${STATE_DIR:-$HOME/.claude/channels/telegram}"
 SYSTEMD_DIR="$HOME/.config/systemd/user"
@@ -33,7 +33,7 @@ die() { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 
 say "claude-channels-custom-tg installer"
 echo "    repo:        $REPO_DIR"
-echo "    projects:    $PROJECTS_DIR"
+echo "    topic root:  $TOPIC_ROOT"
 echo "    bin:         $BIN_DIR"
 echo "    state:       $STATE_DIR"
 echo "    systemd dir: $SYSTEMD_DIR"
@@ -149,11 +149,14 @@ case ":$PATH:" in
   *) warn "$BIN_DIR is not in your PATH; add it to ~/.bashrc or equivalent" ;;
 esac
 
-# ─── 5. MCP registration in project settings ─────────────────────────────
-say "Registering MCP in $PROJECTS_DIR/.claude/settings.json"
-mkdir -p "$PROJECTS_DIR/.claude"
-SETTINGS="$PROJECTS_DIR/.claude/settings.json"
+# ─── 5. MCP registration in topic-root settings ──────────────────────────
+say "Registering MCP in $TOPIC_ROOT/.claude/settings.json"
+mkdir -p "$TOPIC_ROOT/.claude"
+SETTINGS="$TOPIC_ROOT/.claude/settings.json"
 MCP_PATH="$REPO_DIR/telegram-ss"
+
+# Each per-topic dir created at spawn time symlinks its .claude to this
+# shared one, so MCP config + skills are configured once for all topics.
 
 # jq merge: read existing settings (or default {}), set mcpServers.telegram-ss.
 if [[ -f "$SETTINGS" ]]; then
@@ -172,6 +175,10 @@ tmp=$(mktemp)
 echo "$new" > "$tmp"
 mv "$tmp" "$SETTINGS"
 ok "MCP registered"
+
+# Pre-create the root-dm working dir (thread_id=0 case).
+mkdir -p "$TOPIC_ROOT/root"
+[[ -e "$TOPIC_ROOT/root/.claude" ]] || ln -s "$TOPIC_ROOT/.claude" "$TOPIC_ROOT/root/.claude"
 
 # ─── 6. systemd user unit ────────────────────────────────────────────────
 say "Installing systemd user unit"
