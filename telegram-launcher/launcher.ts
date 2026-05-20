@@ -324,9 +324,15 @@ function spawnSession(opts: {
   })
 }
 
-function killSession(threadId: number): void {
+// Threads we've intentionally stopped — the upcoming socket-disconnect
+// shouldn't trigger a "Claude остановился" surprise notification (we
+// already showed the user a confirmation).
+const expectedDisconnects = new Set<number>()
+
+function killSession(threadId: number, opts?: { silent?: boolean }): void {
   const rec = registry.get(threadId)
   if (!rec) return
+  if (opts?.silent) expectedDisconnects.add(threadId)
   try {
     spawnSync('tmux', ['kill-session', '-t', rec.tmuxSession], { stdio: 'ignore' })
   } catch {}
@@ -472,14 +478,20 @@ createIpcServer({
   },
   onDisconnect(sock) {
     const threadId = registry.detachSocket(sock)
-    if (threadId != null) {
-      process.stderr.write(`telegram-dispatcher: MCP for thread=${threadId} disconnected\n`)
-      // Notify the user that the session died and offer a relaunch menu.
-      const rec = registry.get(threadId)
-      if (rec) {
-        notifySessionEnded(rec)
-        registry.remove(threadId)
-      }
+    if (threadId == null) return
+    process.stderr.write(`telegram-dispatcher: MCP for thread=${threadId} disconnected\n`)
+    if (expectedDisconnects.has(threadId)) {
+      // We initiated this (via /stop or similar) — user has already been
+      // told what's happening. Don't tack on an unexpected "Claude
+      // остановился" message.
+      expectedDisconnects.delete(threadId)
+      registry.remove(threadId)
+      return
+    }
+    const rec = registry.get(threadId)
+    if (rec) {
+      notifySessionEnded(rec)
+      registry.remove(threadId)
     }
   },
 })
@@ -689,6 +701,24 @@ bot.command('resume', async ctx => {
   ipcSend(rec.threadId, { type: 'tui_send', mode: 'slash', payload: '/resume' })
   ipcSend(rec.threadId, { type: 'watch_dialog' })
   await ctx.reply('Sent /resume.', { message_thread_id: contextThreadId(ctx) || undefined })
+})
+
+bot.command('stop', async ctx => {
+  const gated = dmCommandGate(ctx)
+  if (!gated || !gated.access.allowFrom.includes(gated.senderId)) return
+  const threadId = contextThreadId(ctx)
+  const rec = registry.get(threadId)
+  if (!rec) {
+    await ctx.reply('No session is running in this thread.', {
+      message_thread_id: threadId || undefined,
+    })
+    return
+  }
+  killSession(threadId, { silent: true })
+  await ctx.reply('Сессия остановлена. tmux/Claude убиты, файлы в cwd сохранены. На следующее сообщение в этом топике поднимется новая (или жми Continue ниже).', {
+    message_thread_id: threadId || undefined,
+    reply_markup: sessionMenu(),
+  })
 })
 
 // ── Callback queries — dispatch by prefix ─────────────────────────────────
@@ -1068,6 +1098,7 @@ void (async () => {
             { command: 'clear', description: 'Clear context' },
             { command: 'resume', description: 'Resume conversation' },
             { command: 'interrupt', description: 'Interrupt (Esc)' },
+            { command: 'stop', description: 'Kill Claude session in this topic' },
           ], { scope: { type: 'all_private_chats' } }).catch(() => {})
         },
       })
