@@ -1,0 +1,22 @@
+# Secrets — bot tokens, API keys
+.env
+*.env
+
+# Runtime state — bot lock, marker files, inbox attachments, approved cache
+bot.pid
+*.marker
+inbox/
+approved/
+
+# Logs and debug
+*.log
+/tmp/*
+
+# Dependencies (resolved from lockfiles)
+node_modules/
+
+# Editor / OS noise
+.DS_Store
+.vscode/
+.idea/
+*.swp

@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ~/.local/bin holds `claude` and `bun`; ensure it's reachable when invoked
+# from a non-interactive shell (e.g. spawned by a systemd user service whose
+# PATH doesn't include it).
+case ":${PATH}:" in
+  *":${HOME}/.local/bin:"*) ;;
+  *) PATH="${HOME}/.local/bin:${PATH}" ;;
+esac
+export PATH
+
+PROJECTS_DIR="${CLAUDE_PROJECTS_DIR:-$HOME/projects}"
+CHANNEL_SPEC="${CLAUDE_CHANNEL_SPEC:-server:telegram-ss}"
+SESSION_NAME="${CLAUDE_TMUX_SESSION:-claude_${CHANNEL_SPEC//[^[:alnum:]]/_}}"
+
+# tmux strips most env vars (incl. PATH) when spawning a pane, so even with
+# ~/.local/bin in our PATH, the `claude` invocation inside the pane wouldn't
+# resolve. Resolve to an absolute path here.
+CLAUDE_BIN="$(command -v claude || true)"
+if [[ -z "${CLAUDE_BIN}" ]]; then
+  echo "claude-channels-tmux: 'claude' not found in PATH (looked in: ${PATH})" >&2
+  exit 1
+fi
+
+build_claude_cmd() {
+  local -a cmd=("${CLAUDE_BIN}")
+  # `server:` channels: pass ONLY --dangerously-load-development-channels.
+  # If we ALSO pass --channels, the binary builds two entries for the same name
+  # — one without `dev` (from --channels), one with `dev:true` (from dev flag).
+  # The channel-loader uses Array.find() which returns the non-dev entry first
+  # and rejects it as "not on allowlist", silently dropping all inbound.
+  # Plugin channels still need --channels (they're allowlisted differently).
+  if [[ "${CHANNEL_SPEC}" == server:* ]]; then
+    cmd+=(--dangerously-load-development-channels "${CHANNEL_SPEC}")
+  else
+    cmd+=(--channels "${CHANNEL_SPEC}")
+  fi
+  cmd+=(--dangerously-skip-permissions --debug-file /tmp/claude-spawn.log)
+  printf '%s\n' "${cmd[@]}"
+}
+
+usage() {
+  cat <<'EOF'
+Usage: claude-channels-tmux <start|continue|stop|restart|status|logs>
+
+  start     — spawn a fresh Claude Code session in tmux.
+  continue  — same as start but with --continue (resumes the most recent
+              conversation in the working directory).
+  stop      — kill the tmux session.
+  restart   — stop then start.
+  status    — show tmux pane info.
+  logs      — print the last 200 lines from the pane.
+
+Environment overrides:
+  CLAUDE_CHANNEL_SPEC   Claude channel spec. Defaults to
+                        plugin:telegram@claude-plugins-official
+  CLAUDE_TMUX_SESSION   Explicit tmux session name. Defaults to a name derived
+                        from CLAUDE_CHANNEL_SPEC.
+EOF
+}
+
+has_session() {
+  tmux has-session -t "${SESSION_NAME}" 2>/dev/null
+}
+
+confirm_dev_channels_prompt() {
+  [[ "${CHANNEL_SPEC}" == server:* ]] || return 0
+
+  # --dangerously-load-development-channels shows an interactive consent prompt
+  # ("I am using this for local development"). Without a TTY user, the session
+  # silently hangs there and the bot appears dead. Poll the pane and press Enter.
+  local deadline=$(( SECONDS + 15 ))
+  while (( SECONDS < deadline )); do
+    if tmux capture-pane -p -t "${SESSION_NAME}:0.0" 2>/dev/null \
+         | grep -q "I am using this for local development"; then
+      tmux send-keys -t "${SESSION_NAME}:0.0" Enter
+      return 0
+    fi
+    sleep 0.2
+  done
+  echo "warning: dev-channels consent prompt not seen within 15s" >&2
+  return 1
+}
+
+start_session() {
+  local mode="${1:-start}"
+  if has_session; then
+    echo "tmux session '${SESSION_NAME}' already exists"
+    return 0
+  fi
+
+  mkdir -p "${PROJECTS_DIR}"
+
+  local -a cmd=()
+  while IFS= read -r line; do
+    cmd+=("${line}")
+  done < <(build_claude_cmd)
+  if [[ "${mode}" == "continue" ]]; then
+    cmd+=(--continue)
+  fi
+
+  local command
+  printf -v command 'cd %q && exec' "${PROJECTS_DIR}"
+  for arg in "${cmd[@]}"; do
+    printf -v command '%s %q' "${command}" "${arg}"
+  done
+
+  tmux new-session -d -s "${SESSION_NAME}" "${command}"
+  confirm_dev_channels_prompt || true
+  echo "started tmux session '${SESSION_NAME}' (${mode})"
+}
+
+stop_session() {
+  if ! has_session; then
+    echo "tmux session '${SESSION_NAME}' is not running"
+    return 0
+  fi
+
+  tmux kill-session -t "${SESSION_NAME}"
+  echo "stopped tmux session '${SESSION_NAME}'"
+}
+
+status_session() {
+  if ! has_session; then
+    echo "tmux session '${SESSION_NAME}' is not running"
+    return 1
+  fi
+
+  tmux list-panes -t "${SESSION_NAME}" -F 'session=#{session_name} pane_pid=#{pane_pid} pane_current_command=#{pane_current_command} pane_current_path=#{pane_current_path} pane_dead=#{pane_dead}'
+}
+
+logs_session() {
+  if ! has_session; then
+    echo "tmux session '${SESSION_NAME}' is not running"
+    return 1
+  fi
+
+  tmux capture-pane -p -t "${SESSION_NAME}:0.0" | tail -n 200
+}
+
+main() {
+  local action="${1:-}"
+
+  case "${action}" in
+    start)
+      start_session start
+      ;;
+    continue)
+      start_session continue
+      ;;
+    stop)
+      stop_session
+      ;;
+    restart)
+      stop_session
+      start_session start
+      ;;
+    status)
+      status_session
+      ;;
+    logs)
+      logs_session
+      ;;
+    *)
+      usage
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"
