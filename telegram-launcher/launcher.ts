@@ -363,8 +363,11 @@ createIpcServer({
         bot.api.editMessageText(ack.chatId, ack.messageId, ack.label).catch(() => {})
       }
       // Flush any auto-launch queued inbound — messages that arrived before
-      // the MCP was ready get delivered now in order.
-      drainQueue(thread_id)
+      // the MCP was ready get delivered now in order. A short delay gives
+      // Claude time to finish wiring up its channel notification handler
+      // (the MCP `register` event fires on socket connect, but Claude's
+      // capability subscription completes ~50-200ms after mcp.connect).
+      setTimeout(() => drainQueue(thread_id), 800)
       return
     }
     if (msg.type === 'permission_reply' || msg.type === 'outbound_dialog') {
@@ -410,7 +413,50 @@ function drainQueue(threadId: number): void {
   if (!queue) return
   pendingInboundQueue.delete(threadId)
   spawningThreads.delete(threadId)
+  stopSpawnTyping(threadId)
   for (const msg of queue) ipcSend(threadId, { type: 'inbound', method: msg.method, params: msg.params })
+}
+
+// Derive a topic name from the first user message. Telegram caps at 128
+// chars; we keep it much tighter so the topic list stays readable. First
+// line, trimmed, with an ellipsis on overflow.
+function topicNameFromText(text: string): string {
+  const firstLine = text.split('\n')[0].trim() || 'Claude'
+  return firstLine.length > 30 ? firstLine.slice(0, 27) + '…' : firstLine
+}
+
+async function renameTopic(chatId: number, threadId: number, name: string): Promise<void> {
+  if (!threadId) return // general/root chat — not a topic, can't rename
+  try {
+    await bot.api.editForumTopic(chatId, threadId, { name })
+  } catch (err) {
+    // Common causes: bot lacks `can_manage_topics`, or the chat isn't a forum.
+    // Either way the spawned session still works; the name just stays default.
+    process.stderr.write(`telegram-dispatcher: editForumTopic(${chatId},${threadId}) failed: ${err}\n`)
+  }
+}
+
+// Per-thread typing-indicator loop kept alive while a session is spawning.
+// Telegram chat actions persist ~5s — we re-send every 4s so the "печатает…"
+// indicator stays visible from the moment the user's message arrives until
+// the MCP registers and drains the queue.
+const spawnTypingLoops = new Map<number, NodeJS.Timeout>()
+
+function startSpawnTyping(threadId: number, chatId: number): void {
+  stopSpawnTyping(threadId)
+  const tick = () => {
+    void bot.api.sendChatAction(chatId, 'typing', {
+      message_thread_id: threadId || undefined,
+    } as any).catch(() => {})
+  }
+  tick()
+  const h = setInterval(tick, 4000)
+  spawnTypingLoops.set(threadId, h)
+}
+
+function stopSpawnTyping(threadId: number): void {
+  const h = spawnTypingLoops.get(threadId)
+  if (h) { clearInterval(h); spawnTypingLoops.delete(threadId) }
 }
 
 function startSpawnTimeout(threadId: number, chatId: number): void {
@@ -418,6 +464,7 @@ function startSpawnTimeout(threadId: number, chatId: number): void {
     if (!spawningThreads.has(threadId)) return
     spawningThreads.delete(threadId)
     pendingInboundQueue.delete(threadId)
+    stopSpawnTyping(threadId)
     bot.api.sendMessage(chatId, '⚠ Не удалось запустить Claude (таймаут). Тапни кнопку чтобы попробовать ещё раз.', {
       message_thread_id: threadId || undefined, reply_markup: sessionMenu(),
     }).catch(() => {})
@@ -771,12 +818,18 @@ async function handleInbound(
     process.stderr.write(`telegram-dispatcher: auto-launching session for thread ${threadId}\n`)
     spawnSession({ chatId, threadId, action: 'launch' })
     startSpawnTimeout(threadId, chatId)
-    // Signal "we got your message, hang on" — sendChatAction shows the
-    // "typing…" indicator above the chat. The MCP will pick this up itself
-    // once it starts streaming its draft response.
-    void bot.api.sendChatAction(chat_id, 'typing', {
-      message_thread_id: threadId || undefined,
-    } as any).catch(() => {})
+    // Continuous "печатает…" indicator from now until MCP registers and
+    // drains the queue. Without this the user sees no feedback during the
+    // ~5s spawn window and assumes the bot is dead.
+    startSpawnTyping(threadId, chatId)
+    // Name the new topic after the first message immediately — gives a
+    // recognizable title before Claude has a chance to do its own smarter
+    // rename via the rename_topic tool.
+    void renameTopic(chatId, threadId, topicNameFromText(text))
+  } else {
+    // Already spawning; just keep typing alive (in case the user sends
+    // more messages, we still want indicator visible).
+    startSpawnTyping(threadId, chatId)
   }
 }
 
