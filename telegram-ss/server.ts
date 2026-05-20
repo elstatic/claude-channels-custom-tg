@@ -318,14 +318,28 @@ function stopTyping(chat_id: string): void {
   }
 }
 
-// ─ Streaming-draft live trace ─────────────────────────────────────────────
-// Telegram Bot API: sendMessageDraft. Successive calls with the same draft_id
-// in the same chat animate as a single live-updating message. We use it to
-// surface Claude's in-flight tool calls / thinking, scraped from the tmux
-// pane. The draft becomes "permanent" naturally when the real reply lands —
-// our reply tool sends a sendMessage afterwards.
+// ─ Edit-based live trace ─────────────────────────────────────────────────
+// Stream Claude's in-flight tool calls / thinking as a SINGLE Telegram
+// message that we keep editing. Mirrors what openclaw does — they use
+// editMessageText for the same purpose. Key wins over sendMessageDraft:
+//
+//   - editMessageText doesn't raise the chat's unread badge (drafts do, on
+//     every tick); the message visibly updates in place.
+//   - The trace stays in chat history afterwards (we delete on stopStreaming
+//     so the timeline ends up clean: just user → final reply).
+//   - No "5 unread" inflation from rapid ticks.
+//
+// First tick when there's something to show → sendMessage (yes, that one
+// pings unread, but exactly once per turn, just like a normal bot reply).
+// Subsequent ticks → editMessageText. Telegram tolerates ~30 edits/min on
+// one message; we tick every 2s (≤30/min) and gate on digest change.
 
-type StreamState = { draftId: number; handle: NodeJS.Timeout; lastDigest: string }
+type StreamState = {
+  handle: NodeJS.Timeout
+  lastDigest: string
+  messageId: number | null
+  inFlight: boolean // edit in progress, skip next tick to avoid stacking
+}
 const streamingSessions = new Map<string, StreamState>()
 
 function snapshotPane(): string | null {
@@ -354,22 +368,42 @@ function extractClaudeTrace(pane: string): string {
 function startStreaming(chat_id: string): void {
   stopStreaming(chat_id)
   const state: StreamState = {
-    draftId: Date.now() & 0x7fffffff, // 32-bit positive int
+    handle: setInterval(() => { void tickStream(chat_id) }, 2000),
     lastDigest: '',
-    handle: setInterval(() => tickStream(chat_id), 1500),
+    messageId: null,
+    inFlight: false,
   }
   streamingSessions.set(chat_id, state)
 }
 
-function tickStream(chat_id: string): void {
+async function tickStream(chat_id: string): Promise<void> {
   const state = streamingSessions.get(chat_id)
-  if (!state) return
+  if (!state || state.inFlight) return
   const pane = snapshotPane()
   if (!pane) return
   const digest = extractClaudeTrace(pane)
   if (!digest || digest === state.lastDigest) return
-  state.lastDigest = digest
-  void bot.api.sendMessageDraft(Number(chat_id), state.draftId, digest).catch(() => {})
+  state.inFlight = true
+  try {
+    if (state.messageId == null) {
+      const sent = await bot.api.sendMessage(chat_id, digest, { disable_notification: true })
+      state.messageId = sent.message_id
+      state.lastDigest = digest
+    } else {
+      try {
+        await bot.api.editMessageText(chat_id, state.messageId, digest)
+        state.lastDigest = digest
+      } catch (err) {
+        // "message is not modified" is benign — bot.api throws but we already
+        // know the digest matched. Anything else we swallow too; streaming
+        // is best-effort.
+      }
+    }
+  } finally {
+    // Refetch in case stopStreaming raced and cleared the entry.
+    const s = streamingSessions.get(chat_id)
+    if (s) s.inFlight = false
+  }
 }
 
 function stopStreaming(chat_id: string): void {
@@ -377,6 +411,12 @@ function stopStreaming(chat_id: string): void {
   if (!state) return
   clearInterval(state.handle)
   streamingSessions.delete(chat_id)
+  // Clean up the trace message — keeps the final chat timeline tidy
+  // (user → final reply, nothing else). Fire-and-forget; if the user
+  // already saw it that's fine.
+  if (state.messageId != null) {
+    bot.api.deleteMessage(chat_id, state.messageId).catch(() => {})
+  }
 }
 
 // Receive permission_request from CC → format → send to all allowlisted DMs.
@@ -944,16 +984,14 @@ function handleInboundEvent(method: string, params: any): void {
   if (method === 'notifications/claude/channel/permission_more') return
 
   // Everything else (notably notifications/claude/channel) goes to Claude as-is.
-  // Auto-start the "печатает…" indicator on every user message so feedback
-  // appears immediately. We intentionally do NOT auto-start sendMessageDraft
-  // streaming here — drafts have no disable_notification and some Telegram
-  // clients flash the unread badge on every draft tick (~1.5s), producing
-  // a "5 unread" effect even though only one logical message is in flight.
-  // Claude can opt into the live trace explicitly via start_typing.
+  // Auto-start both the "печатает…" indicator and the edit-based live trace
+  // on every user message. The trace is one editMessageText-updated bubble
+  // that gets deleted when Claude replies — no per-tick unread spam.
   if (method === 'notifications/claude/channel') {
     const chat_id = (params as any)?.meta?.chat_id
     if (typeof chat_id === 'string' && chat_id.length > 0) {
       try { startTyping(chat_id) } catch {}
+      try { startStreaming(chat_id) } catch {}
     }
   }
   void mcp.notification({ method, params }).catch(err => {
