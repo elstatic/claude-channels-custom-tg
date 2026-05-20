@@ -334,6 +334,15 @@ function spawnSession(opts: {
 // already showed the user a confirmation).
 const expectedDisconnects = new Set<number>()
 
+// MCP socket sometimes briefly drops during claude operations like `/model`
+// picker (claude reinitializes MCP connections when the model changes). The
+// process is still alive; reconnection happens within 1-3 seconds. We delay
+// the "Claude остановился" notification by GRACE_MS so transient drops don't
+// surface as scary deaths. If the MCP doesn't reconnect within the grace
+// window, the timer fires and the real notification goes out.
+const SESSION_DEATH_GRACE_MS = 5000
+const pendingDeathNotifications = new Map<number, NodeJS.Timeout>()
+
 function killSession(threadId: number, opts?: { silent?: boolean }): void {
   const rec = registry.get(threadId)
   if (!rec) return
@@ -558,6 +567,13 @@ createIpcServer({
       }
       registry.attachSocket(thread_id, sock, pid)
       process.stderr.write(`telegram-dispatcher: registered MCP thread=${thread_id} pid=${pid}\n`)
+      // Reconnect within the grace window — cancel the pending death notif.
+      const pendingDeath = pendingDeathNotifications.get(thread_id)
+      if (pendingDeath) {
+        clearTimeout(pendingDeath)
+        pendingDeathNotifications.delete(thread_id)
+        process.stderr.write(`telegram-dispatcher: thread=${thread_id} reconnected in grace window, suppressing death notif\n`)
+      }
       // If we had a launching message pending for this thread, ack now.
       const ack = pendingAcks.get(thread_id)
       if (ack) {
@@ -585,17 +601,25 @@ createIpcServer({
     process.stderr.write(`telegram-dispatcher: MCP for thread=${threadId} disconnected\n`)
     if (expectedDisconnects.has(threadId)) {
       // We initiated this (via /stop or similar) — user has already been
-      // told what's happening. Don't tack on an unexpected "Claude
-      // остановился" message.
+      // told what's happening.
       expectedDisconnects.delete(threadId)
       registry.remove(threadId)
       return
     }
-    const rec = registry.get(threadId)
-    if (rec) {
-      notifySessionEnded(rec)
-      registry.remove(threadId)
-    }
+    // Grace period: claude operations like /model picker can briefly drop
+    // the MCP socket and reconnect ~1-3s later. Schedule the death notif
+    // but cancel it if the MCP reconnects in time.
+    const existing = pendingDeathNotifications.get(threadId)
+    if (existing) clearTimeout(existing)
+    const timer = setTimeout(() => {
+      pendingDeathNotifications.delete(threadId)
+      const cur = registry.get(threadId)
+      if (cur && !cur.socket) {
+        notifySessionEnded(cur)
+        registry.remove(threadId)
+      }
+    }, SESSION_DEATH_GRACE_MS)
+    pendingDeathNotifications.set(threadId, timer)
   },
 })
 process.stderr.write(`telegram-dispatcher: IPC server listening at ${IPC_SOCKET}\n`)
