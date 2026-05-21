@@ -368,13 +368,15 @@ function snapshotPane(): string | null {
 }
 
 function extractClaudeTrace(pane: string): string {
-  // Lines beginning with ● are tool invocations; ✻ marks thinking; ⎿ is the
-  // tool result indent. Pull the trailing window of these — that's the
-  // "what Claude is doing right now" feed.
+  // Lines beginning with ● are tool invocations / Claude's text; ⎿ is the
+  // tool-result indent. ✻ marks thinking status ("Crunched for 4s"); those
+  // are useful as a live progress signal while editing, but once a turn
+  // ends without a reply() call the trace becomes the user's final view
+  // and the timers look like rapid garbage. Drop ✻ lines from the digest.
   const interesting: string[] = []
   for (const raw of pane.split('\n')) {
     const line = raw.replace(/\x1b\[[0-9;]*m/g, '').trimEnd()
-    if (/^\s*[●✻⎿]/.test(line)) interesting.push(line)
+    if (/^\s*[●⎿]/.test(line)) interesting.push(line)
   }
   const tail = interesting.slice(-12).join('\n').trim()
   // Telegram limit is 4096 chars; trim with margin for parse_mode/entities.
