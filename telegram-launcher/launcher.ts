@@ -343,6 +343,19 @@ const expectedDisconnects = new Set<number>()
 const SESSION_DEATH_GRACE_MS = 5000
 const pendingDeathNotifications = new Map<number, NodeJS.Timeout>()
 
+function readPpid(pid: number): number | null {
+  try {
+    const s = readFileSync(`/proc/${pid}/stat`, 'utf8')
+    // pid (comm) state ppid ... — comm can contain spaces+parens, so split
+    // from the LAST ')'.
+    const tail = s.slice(s.lastIndexOf(')') + 2).split(' ')
+    const ppid = Number(tail[1])
+    return ppid > 0 ? ppid : null
+  } catch {
+    return null
+  }
+}
+
 function killSession(threadId: number, opts?: { silent?: boolean }): void {
   const rec = registry.get(threadId)
   if (!rec) return
@@ -350,25 +363,52 @@ function killSession(threadId: number, opts?: { silent?: boolean }): void {
   try {
     spawnSync('tmux', ['kill-session', '-t', rec.tmuxSession], { stdio: 'ignore' })
   } catch {}
+  // Belt-and-braces: if the tmux server itself is dead the kill-session above
+  // is a no-op, leaving claude + its MCP child running with their pty orphaned.
+  // Walk up the process tree from the recorded MCP pid (MCP → bun wrapper →
+  // claude) and SIGTERM claude directly so the whole subtree winds down.
+  // If tmux was alive, claude has already exited by the time this fires and
+  // every process.kill below no-ops.
+  if (rec.pid) {
+    const mcpPid = rec.pid
+    setTimeout(() => {
+      try { process.kill(mcpPid, 0) } catch { return } // already gone — good
+      const wrapperPid = readPpid(mcpPid)
+      const claudePid = wrapperPid ? readPpid(wrapperPid) : null
+      const target = claudePid && claudePid > 1 ? claudePid : mcpPid
+      try { process.kill(target, 'SIGTERM') } catch {}
+      setTimeout(() => { try { process.kill(target, 'SIGKILL') } catch {} }, 3000)
+    }, 1000)
+  }
   registry.remove(threadId)
 }
 
 // ── Topic-existence probe ─────────────────────────────────────────────────
-// Telegram doesn't emit a forum_topic_deleted event for DM-mode topics, so we
-// can't react to deletion directly. Instead we send a single-character message
-// disable_notification=true to each registered topic and immediately delete it
-// — Telegram clients usually don't render a message that's deleted within
-// ~500ms. If the send fails with "message thread not found", the topic was
-// deleted and we can clean up the corresponding tmux+Claude session.
+// There is no silent way to probe a DM-with-topics thread for liveness via
+// Bot API. Everything we tried either side-effects the chat or doesn't
+// actually validate the thread:
+//   1. sendMessage + deleteMessage      — Desktop bumps unread badge
+//   2. sendChatAction('typing', thread) — typing indicator in PARENT chat
+//                                         AND returns ok:true for non-existent
+//                                         threads (doesn't validate at all)
+//   3. editForumTopic(chat, thread, {}) — no-op accepted, returns ok:true
+//                                         even on deleted threads
+//   4. unpinAllForumTopicMessages       — same: ok:true regardless
+// Bot API only validates message_thread_id when an actual change is requested
+// (editForumTopic with a real `name` returns TOPIC_ID_INVALID on dead, but
+// renames + emits a service message on live — not acceptable).
+// So: no periodic sweep. Cleanup is REACTIVE only — server.ts catches
+// "message thread not found" on outbound and signals topic_deleted via IPC,
+// triggering killSession (see McpToDispatcher handler below).
 
 async function probeTopicAlive(chatId: number, threadId: number): Promise<boolean> {
   if (!threadId) return true
+  // Real probes have side effects; we only call this from fireJob where the
+  // cron is about to fire something visible anyway, so reuse the lighter
+  // sendChatAction path (false positives are harmless there — the subsequent
+  // sendMessage will surface the actual error).
   try {
-    const sent = await bot.api.sendMessage(chatId, '.', {
-      message_thread_id: threadId,
-      disable_notification: true,
-    })
-    bot.api.deleteMessage(chatId, sent.message_id).catch(() => {})
+    await bot.api.sendChatAction(chatId, 'typing', { message_thread_id: threadId } as any)
     return true
   } catch (err) {
     if (err instanceof GrammyError && /thread not found/i.test(err.description ?? '')) {
@@ -435,12 +475,30 @@ async function sweepDeletedTopics(): Promise<void> {
   }
 }
 
-const TOPIC_SWEEP_INTERVAL_MS = 60 * 1000
-// Run an initial sweep shortly after startup (lets MCPs reconnect first), then
-// periodically. Long-tail orphans created before this code existed get cleaned
-// up automatically.
-setTimeout(() => { void sweepDeletedTopics() }, 5000)
-setInterval(() => { void sweepDeletedTopics() }, TOPIC_SWEEP_INTERVAL_MS).unref()
+// Per-topic existence-probing has no silent path on Bot API — see
+// probeTopicAlive. Instead of polling, sweep by IDLE TIME: sessions with no
+// inbound activity for N hours get killed. User can resume any session by
+// sending a new message into that topic (auto-launch flow handles the rest).
+// N defaults to 3 hours, override via CLAUDE_TG_IDLE_HOURS env.
+const IDLE_TIMEOUT_MS = (parseFloat(process.env.CLAUDE_TG_IDLE_HOURS ?? '3') || 3) * 3600_000
+const IDLE_SWEEP_INTERVAL_MS = 30 * 60 * 1000  // check every 30 min
+
+function sweepIdleSessions(): void {
+  const now = Date.now()
+  for (const rec of registry.all()) {
+    if (!rec.threadId) continue  // never auto-kill the root chat session
+    const since = rec.lastActivityAt ?? rec.startedAt
+    if (now - since > IDLE_TIMEOUT_MS) {
+      const hours = ((now - since) / 3600_000).toFixed(1)
+      process.stderr.write(`telegram-dispatcher: thread ${rec.threadId} idle for ${hours}h, killing session\n`)
+      killSession(rec.threadId, { silent: true })
+    }
+  }
+}
+
+setTimeout(sweepIdleSessions, 60_000)
+setInterval(sweepIdleSessions, IDLE_SWEEP_INTERVAL_MS).unref()
+void sweepDeletedTopics  // keep symbol — fireJob still uses probeTopicAlive
 
 // ── Cron scheduler ───────────────────────────────────────────────────────
 // Periodically (every 60s) walks `jobs` and fires any whose nextFireAt has
@@ -548,6 +606,9 @@ const pendingOutbound = new Map<number, object[]>()
 const MAX_PENDING_OUTBOUND = 32
 
 function ipcSend(threadId: number, msg: object): boolean {
+  // Treat anything we send to the MCP as activity — covers user messages,
+  // cron fires, slash commands, prompt answers. The idle sweep uses this.
+  if ((msg as { type?: string }).type === 'inbound') registry.touch(threadId)
   const sock = registry.socketOf(threadId)
   if (sock && !sock.destroyed) {
     sendJson(sock, msg)
@@ -617,6 +678,17 @@ createIpcServer({
       // Server.ts side decided to surface a dialog or to relay a permission.
       // These currently aren't initiated dispatcher-side so we don't need to
       // handle them here — kept for protocol completeness.
+      return
+    }
+    if (msg.type === 'topic_deleted') {
+      // MCP hit "Bad Request: message thread not found" on outbound — the
+      // user deleted the topic and Telegram never emitted an event we could
+      // hear. Reverse-lookup which thread this socket belongs to and kill.
+      const threadId = registry.threadOf(sock)
+      if (threadId != null) {
+        process.stderr.write(`telegram-dispatcher: thread ${threadId} reports topic deleted, killing session\n`)
+        killSession(threadId, { silent: true })
+      }
       return
     }
   },

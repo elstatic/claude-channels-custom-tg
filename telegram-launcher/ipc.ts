@@ -5,6 +5,7 @@
 //   { type: "register", thread_id, chat_id, pid }
 //   { type: "outbound_dialog", question, options[] }   // a TUI confirm popped up; surface as inline kbd
 //   { type: "permission_reply", request_id, behavior } // Claude's answer to a permission prompt
+//   { type: "topic_deleted" }                          // outbound errored with "thread not found"; kill our session
 //
 // Dispatcher → MCP messages:
 //   { type: "inbound", method, params }                // notifications/claude/channel{,/permission,/prompt_answer}
@@ -20,9 +21,10 @@ export type WatchDialogMsg = { type: 'watch_dialog' }
 export type OutboundDialogMsg = { type: 'outbound_dialog'; question: string; options: { idx: number; label: string }[] }
 export type PermissionReplyMsg = { type: 'permission_reply'; request_id: string; behavior: 'allow' | 'deny' }
 export type PromptAnswerMsg = { type: 'inbound'; method: 'notifications/claude/channel/prompt_answer'; params: { prompt_id: string; idx: number } }
+export type TopicDeletedMsg = { type: 'topic_deleted' }
 
 export type DispatcherToMcp = InboundMsg | TuiSendMsg | WatchDialogMsg
-export type McpToDispatcher = RegisterMsg | OutboundDialogMsg | PermissionReplyMsg
+export type McpToDispatcher = RegisterMsg | OutboundDialogMsg | PermissionReplyMsg | TopicDeletedMsg
 
 // Line-buffered JSON reader. Calls handler(json) for each complete message.
 export function attachLineReader(sock: net.Socket, handler: (line: string) => void) {

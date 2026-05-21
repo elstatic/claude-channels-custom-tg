@@ -12,6 +12,7 @@ export type SessionRecord = {
   tmuxSession: string
   pid?: number        // last known MCP pid
   startedAt: number
+  lastActivityAt?: number  // ms epoch — bumped on every inbound delivered to this session
   // runtime, never persisted:
   socket?: net.Socket
 }
@@ -81,6 +82,21 @@ export class SessionRegistry {
 
   socketOf(threadId: number): net.Socket | undefined {
     return this.byThread.get(threadId)?.socket
+  }
+
+  threadOf(sock: net.Socket): number | null {
+    for (const rec of this.byThread.values()) {
+      if (rec.socket === sock) return rec.threadId
+    }
+    return null
+  }
+
+  touch(threadId: number): void {
+    const rec = this.byThread.get(threadId)
+    if (!rec) return
+    rec.lastActivityAt = Date.now()
+    // Persist lazily — saving on every inbound is overkill; the in-memory
+    // value is what the sweep checks. On graceful shutdown we save() anyway.
   }
 
   all(): SessionRecord[] {

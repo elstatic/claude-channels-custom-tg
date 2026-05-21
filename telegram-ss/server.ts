@@ -347,8 +347,16 @@ type StreamState = {
   lastDigest: string
   messageId: number | null
   inFlight: boolean // edit in progress, skip next tick to avoid stacking
+  startedAt: number // ms epoch — used to delay the first send
 }
 const streamingSessions = new Map<string, StreamState>()
+
+// Delay before the first trace message is sent. Most turns finish in <5s
+// (a one-line answer with no tool calls). Sending a trace for those turns
+// only adds chat noise — and even with disable_notification:true Telegram
+// still pops a silent banner on iOS. Holding the first send until N ms in
+// means short turns never produce a trace message at all.
+const STREAM_FIRST_SEND_DELAY_MS = 5000
 
 function snapshotPane(): string | null {
   // We rely on TMUX_PANE being inherited from the parent Claude process.
@@ -380,6 +388,7 @@ function startStreaming(chat_id: string): void {
     lastDigest: '',
     messageId: null,
     inFlight: false,
+    startedAt: Date.now(),
   }
   streamingSessions.set(chat_id, state)
 }
@@ -387,6 +396,10 @@ function startStreaming(chat_id: string): void {
 async function tickStream(chat_id: string): Promise<void> {
   const state = streamingSessions.get(chat_id)
   if (!state || state.inFlight) return
+  // Don't materialize a trace message for short turns — even silent
+  // sendMessage produces an iOS banner. Once the trace message exists
+  // (messageId != null) we keep updating it via edit, regardless of age.
+  if (state.messageId == null && Date.now() - state.startedAt < STREAM_FIRST_SEND_DELAY_MS) return
   const pane = snapshotPane()
   if (!pane) return
   const digest = extractClaudeTrace(pane)
@@ -419,12 +432,30 @@ function stopStreaming(chat_id: string): void {
   if (!state) return
   clearInterval(state.handle)
   streamingSessions.delete(chat_id)
-  // Clean up the trace message — keeps the final chat timeline tidy
-  // (user → final reply, nothing else). Fire-and-forget; if the user
-  // already saw it that's fine.
+  // Fire-and-forget cleanup for shutdown / non-reply paths. NOTE: races with
+  // an in-flight tick — if tickStream is mid-sendMessage, its messageId lands
+  // AFTER we read state here, leaving the trace orphaned. The reply handler
+  // uses detachStreaming() instead, which awaits the in-flight tick first.
   if (state.messageId != null) {
     bot.api.deleteMessage(chat_id, state.messageId).catch(() => {})
   }
+}
+
+// Race-free variant for the reply path: stop ticks, wait for any in-flight
+// tick to finish (so we capture the messageId it just created), and return
+// the trace messageId for the caller to delete AFTER the real reply lands.
+async function detachStreaming(chat_id: string): Promise<number | null> {
+  const state = streamingSessions.get(chat_id)
+  if (!state) return null
+  clearInterval(state.handle)
+  streamingSessions.delete(chat_id)
+  // Wait out any in-flight sendMessage/editMessageText so state.messageId
+  // is final before we return it.
+  const deadline = Date.now() + 5000
+  while (state.inFlight && Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 25))
+  }
+  return state.messageId
 }
 
 // Receive permission_request from CC → format → send to all allowlisted DMs.
@@ -680,9 +711,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const parseMode = format === 'markdownv2' ? 'MarkdownV2' as const : undefined
 
         assertAllowedChat(chat_id)
-        // Reply lands → no more pseudo-streaming needed.
+        // Reply lands → no more pseudo-streaming needed. Detach the trace
+        // BEFORE sending chunks (so no new tick can fire and resurrect the
+        // trace message after we delete it), but keep the trace messageId
+        // around to delete only AFTER the real reply lands — that way if
+        // sendMessage throws, the user still sees the trace and we don't
+        // wipe their only signal that something happened.
         stopTyping(chat_id)
-        stopStreaming(chat_id)
+        const traceMessageId = await detachStreaming(chat_id)
 
         for (const f of files) {
           assertSendable(f)
@@ -746,6 +782,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             throw new Error(`${method} failed: ${json.description ?? res.statusText}`)
           }
           sentIds.push(json.result.message_id)
+        }
+
+        // Real reply landed — safe to wipe the trace message now.
+        if (traceMessageId != null) {
+          bot.api.deleteMessage(chat_id, traceMessageId).catch(() => {})
         }
 
         const result =
@@ -980,6 +1021,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
+    // Bot API doesn't emit any update when the user deletes a topic. The bot
+    // only finds out on its next outbound — sendMessage/edit/react fail with
+    // "Bad Request: message thread not found". Signal the dispatcher to wind
+    // this session down so we don't sit forever attempting doomed sends.
+    if (/message thread not found/i.test(msg)) {
+      try { ipcClient?.send({ type: 'topic_deleted' }) } catch {}
+    }
     return {
       content: [{ type: 'text', text: `${req.params.name} failed: ${msg}` }],
       isError: true,
