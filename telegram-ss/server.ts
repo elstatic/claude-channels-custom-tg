@@ -18,7 +18,6 @@ import {
 import { z } from 'zod'
 import { Bot, InlineKeyboard, InputFile } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
-import { spawnSync } from 'child_process'
 import { readFileSync, writeFileSync, mkdirSync, statSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
@@ -154,6 +153,11 @@ function defaultAccess(): Access {
 }
 
 const MAX_CHUNK_LIMIT = 4096
+// Per-chunk send deadline. bot.api.sendMessage has no built-in timeout, so a
+// hung connection through the proxy would freeze the whole reply tool-call
+// indefinitely. Bound it: a stuck send aborts and surfaces as an error the
+// agent can retry, instead of an eternal spinner.
+const SEND_TIMEOUT_MS = 30_000
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
 
 // reply's files param takes any path. .env is ~60 bytes and ships as a
@@ -307,158 +311,56 @@ function newPromptId(): string {
 // Per-chat "typing…" loop. Telegram's chat action only persists ~5s, so we
 // repeat it to keep the indicator alive while a long-running response is
 // being composed. Reply() and stop_typing() both cancel.
-const typingLoops = new Map<string, ReturnType<typeof setInterval>>()
+const typingLoops = new Map<string, { interval: ReturnType<typeof setInterval>; maxStop: ReturnType<typeof setTimeout> }>()
+
+// Hard cap so a turn that ends WITHOUT a reply() call (Claude printed to the
+// TUI but never called the tool) doesn't leave the "печатает…" indicator
+// looping forever. reply()/stop_typing() cancel it earlier in the normal case.
+const TYPING_MAX_MS = 180_000
 
 function startTyping(chat_id: string): void {
   stopTyping(chat_id)
   void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
-  const h = setInterval(() => {
+  const interval = setInterval(() => {
     void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
   }, 4000)
-  typingLoops.set(chat_id, h)
+  const maxStop = setTimeout(() => stopTyping(chat_id), TYPING_MAX_MS)
+  typingLoops.set(chat_id, { interval, maxStop })
 }
 
 function stopTyping(chat_id: string): void {
   const h = typingLoops.get(chat_id)
   if (h) {
-    clearInterval(h)
+    clearInterval(h.interval)
+    clearTimeout(h.maxStop)
     typingLoops.delete(chat_id)
   }
 }
 
-// ─ Edit-based live trace ─────────────────────────────────────────────────
-// Stream Claude's in-flight tool calls / thinking as a SINGLE Telegram
-// message that we keep editing. Mirrors what openclaw does — they use
-// editMessageText for the same purpose. Key wins over sendMessageDraft:
-//
-//   - editMessageText doesn't raise the chat's unread badge (drafts do, on
-//     every tick); the message visibly updates in place.
-//   - The trace stays in chat history afterwards (we delete on stopStreaming
-//     so the timeline ends up clean: just user → final reply).
-//   - No "5 unread" inflation from rapid ticks.
-//
-// First tick when there's something to show → sendMessage (yes, that one
-// pings unread, but exactly once per turn, just like a normal bot reply).
-// Subsequent ticks → editMessageText. Telegram tolerates ~30 edits/min on
-// one message; we tick every 2s (≤30/min) and gate on digest change.
-
-type StreamState = {
-  handle: NodeJS.Timeout
-  lastDigest: string
-  messageId: number | null
-  inFlight: boolean // edit in progress, skip next tick to avoid stacking
-  startedAt: number // ms epoch — used to delay the first send
-}
-const streamingSessions = new Map<string, StreamState>()
-
-// Delay before the first trace message is sent. Most turns finish in <5s
-// (a one-line answer with no tool calls). Sending a trace for those turns
-// only adds chat noise — and even with disable_notification:true Telegram
-// still pops a silent banner on iOS. Holding the first send until N ms in
-// means short turns never produce a trace message at all.
-const STREAM_FIRST_SEND_DELAY_MS = 5000
-
-function snapshotPane(): string | null {
-  // We rely on TMUX_PANE being inherited from the parent Claude process.
-  const pane = process.env.TMUX_PANE
-  if (!pane) return null
-  const r = spawnSync('tmux', ['capture-pane', '-p', '-t', pane], { encoding: 'utf8' })
-  if (r.status !== 0 || !r.stdout) return null
-  return r.stdout
-}
-
-function extractClaudeTrace(pane: string): string {
-  // Lines beginning with ● are tool invocations / Claude's text; ⎿ is the
-  // tool-result indent. ✻ marks thinking status ("Crunched for 4s"); those
-  // are useful as a live progress signal while editing, but once a turn
-  // ends without a reply() call the trace becomes the user's final view
-  // and the timers look like rapid garbage. Drop ✻ lines from the digest.
-  const interesting: string[] = []
-  for (const raw of pane.split('\n')) {
-    const line = raw.replace(/\x1b\[[0-9;]*m/g, '').trimEnd()
-    if (/^\s*[●⎿]/.test(line)) interesting.push(line)
-  }
-  const tail = interesting.slice(-12).join('\n').trim()
-  // Telegram limit is 4096 chars; trim with margin for parse_mode/entities.
-  return tail.length > 3500 ? '…\n' + tail.slice(-3500) : tail
-}
-
-function startStreaming(chat_id: string): void {
-  stopStreaming(chat_id)
-  const state: StreamState = {
-    handle: setInterval(() => { void tickStream(chat_id) }, 2000),
-    lastDigest: '',
-    messageId: null,
-    inFlight: false,
-    startedAt: Date.now(),
-  }
-  streamingSessions.set(chat_id, state)
-}
-
-async function tickStream(chat_id: string): Promise<void> {
-  const state = streamingSessions.get(chat_id)
-  if (!state || state.inFlight) return
-  // Don't materialize a trace message for short turns — even silent
-  // sendMessage produces an iOS banner. Once the trace message exists
-  // (messageId != null) we keep updating it via edit, regardless of age.
-  if (state.messageId == null && Date.now() - state.startedAt < STREAM_FIRST_SEND_DELAY_MS) return
-  const pane = snapshotPane()
-  if (!pane) return
-  const digest = extractClaudeTrace(pane)
-  if (!digest || digest === state.lastDigest) return
-  state.inFlight = true
+// The dispatcher (launcher.ts) posts an in-topic "💬 работаю…" status message
+// and records its id in /tmp/claude-tg-status-<thread>.json. On reply we claim
+// that message — mark it consumed (so the launcher's animator stops) and return
+// its id so the caller can edit it in place into the answer. Returns null when
+// there's no fresh status message to claim.
+function consumeStatusMessage(): number | null {
+  if (!THREAD_ID) return null
+  const f = `/tmp/claude-tg-status-${THREAD_ID}.json`
   try {
-    if (state.messageId == null) {
-      const sent = await bot.api.sendMessage(chat_id, digest, { disable_notification: true })
-      state.messageId = sent.message_id
-      state.lastDigest = digest
-    } else {
-      try {
-        await bot.api.editMessageText(chat_id, state.messageId, digest)
-        state.lastDigest = digest
-      } catch (err) {
-        // "message is not modified" is benign — bot.api throws but we already
-        // know the digest matched. Anything else we swallow too; streaming
-        // is best-effort.
-      }
+    const o = JSON.parse(readFileSync(f, 'utf8'))
+    if (o && o.consumed === false && typeof o.message_id === 'number') {
+      writeFileSync(f, JSON.stringify({ ...o, consumed: true }))
+      return o.message_id
     }
-  } finally {
-    // Refetch in case stopStreaming raced and cleared the entry.
-    const s = streamingSessions.get(chat_id)
-    if (s) s.inFlight = false
-  }
+  } catch {}
+  return null
 }
 
-function stopStreaming(chat_id: string): void {
-  const state = streamingSessions.get(chat_id)
-  if (!state) return
-  clearInterval(state.handle)
-  streamingSessions.delete(chat_id)
-  // Fire-and-forget cleanup for shutdown / non-reply paths. NOTE: races with
-  // an in-flight tick — if tickStream is mid-sendMessage, its messageId lands
-  // AFTER we read state here, leaving the trace orphaned. The reply handler
-  // uses detachStreaming() instead, which awaits the in-flight tick first.
-  if (state.messageId != null) {
-    bot.api.deleteMessage(chat_id, state.messageId).catch(() => {})
-  }
-}
-
-// Race-free variant for the reply path: stop ticks, wait for any in-flight
-// tick to finish (so we capture the messageId it just created), and return
-// the trace messageId for the caller to delete AFTER the real reply lands.
-async function detachStreaming(chat_id: string): Promise<number | null> {
-  const state = streamingSessions.get(chat_id)
-  if (!state) return null
-  clearInterval(state.handle)
-  streamingSessions.delete(chat_id)
-  // Wait out any in-flight sendMessage/editMessageText so state.messageId
-  // is final before we return it.
-  const deadline = Date.now() + 5000
-  while (state.inFlight && Date.now() < deadline) {
-    await new Promise(r => setTimeout(r, 25))
-  }
-  return state.messageId
-}
+// Live progress in chat is the native "печатает…" indicator only (above).
+// We deliberately do NOT scrape the Claude Code TUI pane for a trace: that
+// leaked CLI chrome (Tip:… lines, file paths, "Calling …" spinners) into the
+// chat and truncated the real answer. The user's final view is always the
+// agent's explicit reply() call. For interim progress the agent can edit a
+// message via the edit_message tool — clean, controlled text, not a scrape.
 
 // Receive permission_request from CC → format → send to all allowlisted DMs.
 // Groups are intentionally excluded — the security thread resolution was
@@ -713,14 +615,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const parseMode = format === 'markdownv2' ? 'MarkdownV2' as const : undefined
 
         assertAllowedChat(chat_id)
-        // Reply lands → no more pseudo-streaming needed. Detach the trace
-        // BEFORE sending chunks (so no new tick can fire and resurrect the
-        // trace message after we delete it), but keep the trace messageId
-        // around to delete only AFTER the real reply lands — that way if
-        // sendMessage throws, the user still sees the trace and we don't
-        // wipe their only signal that something happened.
+        // Reply lands → stop the "печатает…" indicator.
         stopTyping(chat_id)
-        const traceMessageId = await detachStreaming(chat_id)
 
         for (const f of files) {
           assertSendable(f)
@@ -737,16 +633,33 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const chunks = chunk(text, limit, mode)
         const sentIds: number[] = []
 
+        // If the dispatcher posted an in-topic "💬 работаю…" status message,
+        // morph it into the answer by editing it in place with the first chunk.
+        // Mark it consumed first so the launcher's animator stops touching it.
+        const statusMsgId = consumeStatusMessage()
+
         try {
           for (let i = 0; i < chunks.length; i++) {
             const shouldReplyTo =
               reply_to != null &&
               replyMode !== 'off' &&
               (replyMode === 'all' || i === 0)
+            if (i === 0 && statusMsgId != null) {
+              try {
+                await bot.api.editMessageText(chat_id, statusMsgId, chunks[i], {
+                  ...(parseMode ? { parse_mode: parseMode } : {}),
+                })
+                sentIds.push(statusMsgId)
+                continue
+              } catch {
+                // Status message gone/uneditable — fall through to a normal send
+                // so the reply still lands.
+              }
+            }
             const sent = await bot.api.sendMessage(chat_id, chunks[i], {
               ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
               ...(parseMode ? { parse_mode: parseMode } : {}),
-            })
+            }, AbortSignal.timeout(SEND_TIMEOUT_MS))
             sentIds.push(sent.message_id)
           }
         } catch (err) {
@@ -786,10 +699,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           sentIds.push(json.result.message_id)
         }
 
-        // Real reply landed — safe to wipe the trace message now.
-        if (traceMessageId != null) {
-          bot.api.deleteMessage(chat_id, traceMessageId).catch(() => {})
-        }
+        try {
+          ipcClient?.send({
+            type: 'history_log',
+            role: 'assistant',
+            text,
+            ...(sentIds[0] != null ? { message_id: sentIds[0] } : {}),
+          })
+        } catch {}
 
         const result =
           sentIds.length === 1
@@ -900,7 +817,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           const isLast = i === parts.length - 1
           const sent = await bot.api.sendMessage(chat_id, parts[i], {
             ...(isLast ? { reply_markup: { inline_keyboard: rows } } : {}),
-          })
+          }, AbortSignal.timeout(SEND_TIMEOUT_MS))
           if (isLast) promptMessageId = sent.message_id
         }
 
@@ -931,14 +848,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const chat_id = args.chat_id as string
         assertAllowedChat(chat_id)
         startTyping(chat_id)
-        startStreaming(chat_id)
         return { content: [{ type: 'text', text: 'typing started' }] }
       }
       case 'stop_typing': {
         const chat_id = args.chat_id as string
         assertAllowedChat(chat_id)
         stopTyping(chat_id)
-        stopStreaming(chat_id)
         return { content: [{ type: 'text', text: 'typing stopped' }] }
       }
       case 'rename_topic': {
@@ -1055,7 +970,6 @@ function shutdown(): void {
   }
   pendingPrompts.clear()
   for (const [chat_id] of typingLoops) stopTyping(chat_id)
-  for (const [chat_id] of streamingSessions) stopStreaming(chat_id)
   try { ipcClient?.close() } catch {}
   setTimeout(() => process.exit(0), 1000)
   process.exit(0)
@@ -1130,6 +1044,11 @@ function handleInboundEvent(method: string, params: any): void {
     const option = pending.options[idx]
     clearTimeout(pending.timeout)
     pendingPrompts.delete(prompt_id)
+    if (pending.messageId && option) {
+      void bot.api.editMessageReplyMarkup(pending.chatId, pending.messageId, {
+        reply_markup: undefined,
+      }).catch(() => {})
+    }
     if (option) pending.resolve({ idx, value: option.value, label: option.label })
     return
   }
@@ -1147,14 +1066,12 @@ function handleInboundEvent(method: string, params: any): void {
   if (method === 'notifications/claude/channel/permission_more') return
 
   // Everything else (notably notifications/claude/channel) goes to Claude as-is.
-  // Auto-start both the "печатает…" indicator and the edit-based live trace
-  // on every user message. The trace is one editMessageText-updated bubble
-  // that gets deleted when Claude replies — no per-tick unread spam.
+  // Auto-start the "печатает…" indicator on every user message. It's cancelled
+  // when Claude calls reply() / stop_typing(), or auto-stops after TYPING_MAX_MS.
   if (method === 'notifications/claude/channel') {
     const chat_id = (params as any)?.meta?.chat_id
     if (typeof chat_id === 'string' && chat_id.length > 0) {
       try { startTyping(chat_id) } catch {}
-      try { startStreaming(chat_id) } catch {}
     }
   }
   void mcp.notification({ method, params }).catch(err => {

@@ -39,6 +39,7 @@ import {
   type SessionRecord,
 } from './sessions'
 import { JobStore, nextFireFrom, type ScheduledJob } from './jobs'
+import { TopicDb, defaultDbFile } from './db'
 
 // ── State dir / files ─────────────────────────────────────────────────────
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
@@ -260,6 +261,8 @@ if (!STATIC) setInterval(checkApprovals, 5000).unref()
 // ── Session registry + IPC server ─────────────────────────────────────────
 const registry = new SessionRegistry(SESSIONS_FILE)
 registry.load()
+
+const db = new TopicDb(defaultDbFile(STATE_DIR))
 
 const jobs = new JobStore(JOBS_FILE)
 jobs.load()
@@ -691,6 +694,19 @@ createIpcServer({
       }
       return
     }
+    if (msg.type === 'history_log') {
+      const threadId = registry.threadOf(sock)
+      if (threadId != null) {
+        db.append({
+          thread_id: threadId,
+          role: 'assistant',
+          text: msg.text,
+          ts: Date.now(),
+          message_id: msg.message_id ?? null,
+        })
+      }
+      return
+    }
   },
   onDisconnect(sock) {
     const threadId = registry.detachSocket(sock)
@@ -730,6 +746,15 @@ const pendingAcks = new Map<number, { chatId: number; messageId: number; label: 
 const pendingInboundQueue = new Map<number, Array<{ method: string; params: any }>>()
 const spawningThreads = new Set<number>()
 const SPAWN_TIMEOUT_MS = 60_000
+
+// Threads where we've shown the "restore context?" prompt and are waiting for
+// the user to pick (or for the 60s fallback to fire a clean launch).
+const awaitingContextChoice = new Map<number, {
+  chatId: number
+  promptMessageId?: number
+  timeout: NodeJS.Timeout
+}>()
+const CONTEXT_CHOICE_TIMEOUT_MS = 60_000
 
 function queueInbound(threadId: number, msg: { method: string; params: any }): void {
   let arr = pendingInboundQueue.get(threadId)
@@ -788,12 +813,103 @@ function stopSpawnTyping(threadId: number): void {
   if (h) { clearInterval(h); spawnTypingLoops.delete(threadId) }
 }
 
+// ── In-topic status message ───────────────────────────────────────────────
+// The native "печатает…" chat action shows at the whole-forum level, so the
+// user can't tell WHICH topic is busy. Instead we post a real message INTO the
+// topic ("💬 работаю…") and animate the dots. When the agent replies, server.ts
+// edits this same message into the final answer (in place); the Stop hook does
+// the same as a safety net if no reply ever lands. Coordination is via a tiny
+// per-thread file /tmp/claude-tg-status-<thread>.json with a `consumed` flag —
+// once consumed, the animator below self-stops so it never clobbers the answer.
+const STATUS_DOTS = ['.', '..', '...', '....', '.....']
+const STATUS_MAX_MS = 10 * 60_000
+type StatusEntry = { messageId: number; chatId: number; timer: ReturnType<typeof setInterval>; dot: number; startedAt: number }
+const statusMessages = new Map<number, StatusEntry>()
+
+function statusFile(threadId: number): string {
+  return `/tmp/claude-tg-status-${threadId}.json`
+}
+
+// Live tool-call trace, written by the PostToolUse hook (trace-tool.py). We
+// render it as an expandable blockquote under the "работаю" line.
+function traceFile(threadId: number): string {
+  return `/tmp/claude-tg-trace-${threadId}.txt`
+}
+
+function htmlEscape(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
+// Build the status message body: "💬 работаю" + animated dots, plus — if the
+// hook has recorded any tool calls this turn — an expandable grey blockquote
+// of the last few. Returned as HTML (caller sends parse_mode: 'HTML').
+function renderStatus(threadId: number, dots: string): string {
+  const head = '💬 ' + dots
+  let trace = ''
+  try { trace = readFileSync(traceFile(threadId), 'utf8').trim() } catch {}
+  if (!trace) return head
+  const lines = trace.split('\n').filter(Boolean).slice(-10).map(htmlEscape).join('\n')
+  return head + '\n<blockquote expandable>' + lines + '</blockquote>'
+}
+
+// null = no file; true/false = consumed flag.
+function statusConsumed(threadId: number): boolean | null {
+  try {
+    const o = JSON.parse(readFileSync(statusFile(threadId), 'utf8'))
+    return !!o.consumed
+  } catch { return null }
+}
+
+async function startStatusMessage(threadId: number, chatId: number): Promise<void> {
+  if (!threadId) return
+  // Reuse an existing, still-active status message (rapid-fire inbound) instead
+  // of stacking a second "работаю…" bubble in the topic.
+  if (statusMessages.has(threadId) && statusConsumed(threadId) === false) return
+  stopStatusMessage(threadId)
+  // Fresh working bubble → fresh trace (don't carry over the previous turn's).
+  try { writeFileSync(traceFile(threadId), '') } catch {}
+  let messageId: number
+  try {
+    // Always ship at least one dot — a lone 💬 is a single-emoji message, which
+    // Telegram renders as a jumbo emoji (looks broken). The animator takes over
+    // ~3.5s later; until then this is what the user sees.
+    const sent = await bot.api.sendMessage(chatId, '💬 .', {
+      message_thread_id: threadId || undefined,
+    } as any)
+    messageId = sent.message_id
+  } catch { return }
+  try {
+    writeFileSync(statusFile(threadId), JSON.stringify({
+      chat_id: chatId, thread_id: threadId, message_id: messageId, consumed: false,
+    }))
+  } catch {}
+  const entry: StatusEntry = { messageId, chatId, dot: 0, startedAt: Date.now(), timer: undefined as any }
+  entry.timer = setInterval(() => {
+    // Self-stop once server.ts/the hook took over (consumed) or after the cap.
+    if (statusConsumed(threadId) !== false || Date.now() - entry.startedAt > STATUS_MAX_MS) {
+      stopStatusMessage(threadId)
+      return
+    }
+    entry.dot = (entry.dot + 1) % STATUS_DOTS.length
+    void bot.api.editMessageText(chatId, messageId, renderStatus(threadId, STATUS_DOTS[entry.dot]), {
+      parse_mode: 'HTML',
+    }).catch(() => {})
+  }, 3500)
+  statusMessages.set(threadId, entry)
+}
+
+function stopStatusMessage(threadId: number): void {
+  const e = statusMessages.get(threadId)
+  if (e) { clearInterval(e.timer); statusMessages.delete(threadId) }
+}
+
 function startSpawnTimeout(threadId: number, chatId: number): void {
   setTimeout(() => {
     if (!spawningThreads.has(threadId)) return
     spawningThreads.delete(threadId)
     pendingInboundQueue.delete(threadId)
     stopSpawnTyping(threadId)
+    stopStatusMessage(threadId)
     bot.api.sendMessage(chatId, '⚠ Не удалось запустить Claude (таймаут). Тапни кнопку чтобы попробовать ещё раз.', {
       message_thread_id: threadId || undefined, reply_markup: sessionMenu(),
     }).catch(() => {})
@@ -801,10 +917,65 @@ function startSpawnTimeout(threadId: number, chatId: number): void {
 }
 
 function notifySessionEnded(rec: SessionRecord): void {
+  stopStatusMessage(rec.threadId)
   bot.api.sendMessage(rec.chatId, 'Claude остановился. Что сделать?', {
     message_thread_id: rec.threadId || undefined,
     reply_markup: sessionMenu(),
   }).catch(() => {})
+}
+
+// ── Restart context-restore choice ────────────────────────────────────────
+// When a topic with stored history gets a message but has no live session,
+// offer the user the choice to restore prior context or start clean.
+async function offerContextChoice(chatId: number, threadId: number, n: number) {
+  const kbd = new InlineKeyboard()
+    .text(`📋 Продолжить с контекстом (${n})`, 'ctxlaunch')
+    .text('🆕 Новая сессия', 'freshlaunch')
+  let promptMessageId: number | undefined
+  try {
+    const sent = await bot.api.sendMessage(
+      chatId,
+      'Сессия в этом топике была остановлена. Восстановить контекст прошлой переписки?',
+      { message_thread_id: threadId || undefined, reply_markup: kbd },
+    )
+    promptMessageId = sent.message_id
+  } catch {}
+  const timeout = setTimeout(() => {
+    // fallback: пользователь не выбрал → запускаем чистую сессию
+    awaitingContextChoice.delete(threadId)
+    startContextLaunch(chatId, threadId, false, promptMessageId)
+  }, CONTEXT_CHOICE_TIMEOUT_MS)
+  awaitingContextChoice.set(threadId, { chatId, promptMessageId, timeout })
+}
+
+function startContextLaunch(
+  chatId: number, threadId: number, withContext: boolean, promptMessageId?: number,
+) {
+  if (withContext) prependContextToQueue(threadId)
+  if (promptMessageId != null) {
+    bot.api.editMessageText(
+      chatId, promptMessageId,
+      withContext ? '📋 Продолжаю с контекстом…' : '🆕 Новая сессия…',
+    ).catch(() => {})
+  }
+  spawningThreads.add(threadId)
+  spawnSession({ chatId, threadId, action: 'launch' })
+  startSpawnTimeout(threadId, chatId)
+  startSpawnTyping(threadId, chatId)
+}
+
+function prependContextToQueue(threadId: number) {
+  const q = pendingInboundQueue.get(threadId)
+  if (!q || q.length === 0) return
+  const ctx = db.formatContext(threadId)
+  if (!ctx) return
+  const first = q[0]
+  first.params = {
+    ...first.params,
+    content:
+      '[Previous conversation in this topic:\n' + ctx +
+      '\n---\nNew message:]\n\n' + (first.params as any).content,
+  }
 }
 
 // ── Menus ─────────────────────────────────────────────────────────────────
@@ -988,6 +1159,28 @@ bot.on('callback_query:data', async ctx => {
     return
   }
 
+  // Restart context-restore choice: ctxlaunch / freshlaunch.
+  if (data === 'ctxlaunch' || data === 'freshlaunch') {
+    if (!access.allowFrom.includes(senderId)) {
+      await ctx.answerCallbackQuery({ text: 'Not allowed', show_alert: true })
+      return
+    }
+    if (!chatId) {
+      await ctx.answerCallbackQuery({ text: 'no chat' })
+      return
+    }
+    const pending = awaitingContextChoice.get(threadId)
+    if (!pending) {
+      await ctx.answerCallbackQuery({ text: 'Истекло — отправь сообщение заново' })
+      return
+    }
+    clearTimeout(pending.timeout)
+    awaitingContextChoice.delete(threadId)
+    await ctx.answerCallbackQuery()
+    startContextLaunch(chatId, threadId, data === 'ctxlaunch', pending.promptMessageId)
+    return
+  }
+
   // TUI effort sub-menu: tui:effort:<level>
   const tuiEffort = /^tui:effort:(low|medium|high|xhigh|max)$/.exec(data)
   if (tuiEffort) {
@@ -1126,6 +1319,11 @@ async function handleInbound(
     ]).catch(() => {})
   }
 
+  // Post the in-topic "💬 работаю…" status message right away — for the live
+  // session, the spawn, and the restore-choice paths alike. server.ts turns it
+  // into the answer on reply (covers every branch below in one call).
+  if (threadId !== 0) void startStatusMessage(threadId, chatId)
+
   const imagePath = downloadImage ? await downloadImage() : undefined
 
   // Build the channel notification payload. Same shape as the old in-process
@@ -1150,15 +1348,46 @@ async function handleInbound(
   }
   const inboundMsg = { method: 'notifications/claude/channel', params: inboundParams }
 
+  // Count prior history BEFORE logging this message — otherwise the just-inserted
+  // message makes count >= 1 and a brand-new topic would wrongly offer restore.
+  const priorHistCount = (threadId !== 0) ? db.count(threadId) : 0
+
+  // Log the user's message to the history DB (clean text, all threads incl 0).
+  db.append({
+    thread_id: threadId,
+    role: 'user',
+    text,
+    ts: Date.now(),
+    message_id: msgId ?? null,
+  })
+
   const rec = registry.get(threadId)
   if (rec?.socket) {
     ipcSend(threadId, { type: 'inbound', ...inboundMsg })
     return
   }
 
-  // No live session in this thread → auto-launch and queue this message so
-  // it's the first thing Claude sees on startup. Subsequent messages within
-  // the spawn window queue behind it; we drain on MCP register.
+  // No live session in this thread.
+  // (a) A spawn is already in flight, or we're waiting on the context-restore
+  // choice — just append the raw message to the queue (no rename marker).
+  if (spawningThreads.has(threadId) || awaitingContextChoice.has(threadId)) {
+    queueInbound(threadId, inboundMsg)
+    startSpawnTyping(threadId, chatId)
+    return
+  }
+
+  // (b) Fresh decision point with stored history → offer the restore choice.
+  // Queue the raw message (topic already named, no rename marker), then prompt.
+  if (priorHistCount > 0) {
+    queueInbound(threadId, inboundMsg)
+    await offerContextChoice(chatId, threadId, priorHistCount)
+    startSpawnTyping(threadId, chatId)
+    return
+  }
+
+  // (c) No history → existing auto-launch behavior: queue this message so it's
+  // the first thing Claude sees on startup. Subsequent messages within the
+  // spawn window queue behind it; we drain on MCP register.
   // Attach the rename-topic task as a content prefix on the very first
   // queued message — claude consistently forgets the hint that's only in
   // the MCP system prompt, but treats inline task markers as load-bearing.
@@ -1175,24 +1404,18 @@ async function handleInbound(
   const taggedMsg = { method: 'notifications/claude/channel', params: taggedParams }
 
   queueInbound(threadId, taggedMsg)
-  if (!spawningThreads.has(threadId)) {
-    spawningThreads.add(threadId)
-    process.stderr.write(`telegram-dispatcher: auto-launching session for thread ${threadId}\n`)
-    spawnSession({ chatId, threadId, action: 'launch' })
-    startSpawnTimeout(threadId, chatId)
-    // Continuous "печатает…" indicator from now until MCP registers and
-    // drains the queue. Without this the user sees no feedback during the
-    // ~5s spawn window and assumes the bot is dead.
-    startSpawnTyping(threadId, chatId)
-    // Name the new topic after the first message immediately — gives a
-    // recognizable title before Claude has a chance to do its own smarter
-    // rename via the rename_topic tool.
-    void renameTopic(chatId, threadId, topicNameFromText(text))
-  } else {
-    // Already spawning; just keep typing alive (in case the user sends
-    // more messages, we still want indicator visible).
-    startSpawnTyping(threadId, chatId)
-  }
+  spawningThreads.add(threadId)
+  process.stderr.write(`telegram-dispatcher: auto-launching session for thread ${threadId}\n`)
+  spawnSession({ chatId, threadId, action: 'launch' })
+  startSpawnTimeout(threadId, chatId)
+  // Continuous "печатает…" indicator from now until MCP registers and
+  // drains the queue. Without this the user sees no feedback during the
+  // ~5s spawn window and assumes the bot is dead.
+  startSpawnTyping(threadId, chatId)
+  // Name the new topic after the first message immediately — gives a
+  // recognizable title before Claude has a chance to do its own smarter
+  // rename via the rename_topic tool.
+  void renameTopic(chatId, threadId, topicNameFromText(text))
 }
 
 // ── message:* wiring ──────────────────────────────────────────────────────
