@@ -895,6 +895,11 @@ function htmlEscape(s: string): string {
 // Build the status message body: "💬 работаю" + animated dots, plus — if the
 // hook has recorded any tool calls this turn — an expandable grey blockquote
 // of the last few. Returned as HTML (caller sends parse_mode: 'HTML').
+// One-tap ⏹ on the working bubble — interrupts the current turn from the phone.
+function statusKeyboard(threadId: number): InlineKeyboard {
+  return new InlineKeyboard().text('⏹ Стоп', `stopturn:${threadId}`)
+}
+
 function renderStatus(threadId: number, dots: string): string {
   const head = '💬 ' + dots
   let trace = ''
@@ -927,6 +932,7 @@ async function startStatusMessage(threadId: number, chatId: number): Promise<voi
     // ~3.5s later; until then this is what the user sees.
     const sent = await bot.api.sendMessage(chatId, '💬 .', {
       message_thread_id: threadId || undefined,
+      reply_markup: statusKeyboard(threadId),
     } as any)
     messageId = sent.message_id
   } catch { return }
@@ -946,7 +952,8 @@ async function startStatusMessage(threadId: number, chatId: number): Promise<voi
     entry.dot = (entry.dot + 1) % STATUS_DOTS.length
     void bot.api.editMessageText(chatId, messageId, renderStatus(threadId, STATUS_DOTS[entry.dot]), {
       parse_mode: 'HTML',
-    }).catch(() => {})
+      reply_markup: statusKeyboard(threadId),
+    } as any).catch(() => {})
   }, 3500)
   statusMessages.set(threadId, entry)
 }
@@ -1196,6 +1203,29 @@ bot.on('callback_query:data', async ctx => {
   const senderId = String(ctx.from.id)
   const threadId = contextThreadId(ctx)
   const chatId = ctx.chat?.id
+
+  // ⏹ Stop button on the working bubble — interrupt the current turn.
+  const stopTurn = /^stopturn:(\d+)$/.exec(data)
+  if (stopTurn) {
+    if (!access.allowFrom.includes(senderId)) {
+      await ctx.answerCallbackQuery({ text: 'Not allowed', show_alert: true })
+      return
+    }
+    const t = Number(stopTurn[1])
+    await ctx.answerCallbackQuery({ text: '⏹ Останавливаю…' })
+    // Interrupt the live turn (Esc into the TUI) and stop the animator.
+    ipcSend(t, { type: 'tui_send', mode: 'keys', payload: ['Escape'] })
+    stopStatusMessage(t)
+    // Mark the bubble consumed so a late reply doesn't re-edit it.
+    try {
+      const o = JSON.parse(readFileSync(statusFile(t), 'utf8'))
+      atomicWrite(statusFile(t), JSON.stringify({ ...o, consumed: true }))
+    } catch {}
+    try {
+      await ctx.editMessageText('⏹ Остановлено пользователем', { reply_markup: { inline_keyboard: [] } } as any)
+    } catch {}
+    return
+  }
 
   // Launch/continue session menu.
   if (data === 'launch' || data === 'continue') {
@@ -1492,6 +1522,52 @@ async function handleInbound(
 // ── message:* wiring ──────────────────────────────────────────────────────
 const INBOX_DIR = join(STATE_DIR, 'inbox')
 
+// Voice/audio → text, transcribed by the dispatcher BEFORE Claude sees it, so
+// every session gets the transcript as plain content (no per-session skill
+// dance). Groq Whisper; key from env or ~/.claude/settings.json. Through the
+// same proxy the bot uses. Returns null on any failure (caller falls back).
+let groqKeyCache: string | null | undefined
+function groqApiKey(): string | null {
+  if (groqKeyCache !== undefined) return groqKeyCache
+  groqKeyCache = process.env.GROQ_API_KEY ?? null
+  if (!groqKeyCache) {
+    try {
+      const s = JSON.parse(readFileSync(join(homedir(), '.claude', 'settings.json'), 'utf8'))
+      if (s?.env?.GROQ_API_KEY && typeof s.env.GROQ_API_KEY === 'string') groqKeyCache = s.env.GROQ_API_KEY
+    } catch {}
+  }
+  return groqKeyCache
+}
+
+async function transcribeTgVoice(fileId: string): Promise<string | null> {
+  const key = groqApiKey()
+  if (!key) return null
+  try {
+    const file = await bot.api.getFile(fileId)
+    if (!file.file_path) return null
+    const res = await fetch(`https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`, {
+      signal: AbortSignal.timeout(30_000),
+    })
+    if (!res.ok) return null
+    const bytes = await res.arrayBuffer()
+    const fd = new FormData()
+    fd.set('file', new Blob([bytes]), 'voice.ogg') // Groq rejects .oga; .ogg is fine
+    fd.set('model', 'whisper-large-v3-turbo')
+    const r = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${key}` },
+      body: fd,
+      signal: AbortSignal.timeout(60_000),
+    })
+    const j = await r.json() as { text?: string }
+    const t = (j.text ?? '').trim()
+    return t || null
+  } catch (err) {
+    process.stderr.write(`telegram-dispatcher: voice transcription failed: ${err}\n`)
+    return null
+  }
+}
+
 bot.on('message:text', async ctx => {
   if (ctx.message.text?.startsWith('/')) return // commands handled separately
   await handleInbound(ctx, ctx.message.text, undefined)
@@ -1530,7 +1606,12 @@ bot.on('message:document', async ctx => {
 
 bot.on('message:voice', async ctx => {
   const v = ctx.message.voice
-  await handleInbound(ctx, ctx.message.caption ?? '(voice message)', undefined, {
+  const transcript = await transcribeTgVoice(v.file_id)
+  const cap = ctx.message.caption ? `\n\n${ctx.message.caption}` : ''
+  const content = transcript
+    ? `🎙 (голосовое, расшифровка):\n${transcript}${cap}`
+    : (ctx.message.caption ?? '(voice message)')
+  await handleInbound(ctx, content, undefined, {
     kind: 'voice', file_id: v.file_id, size: v.file_size, mime: v.mime_type,
   })
 })
@@ -1538,7 +1619,12 @@ bot.on('message:voice', async ctx => {
 bot.on('message:audio', async ctx => {
   const a = ctx.message.audio
   const name = safeName(a.file_name)
-  await handleInbound(ctx, ctx.message.caption ?? `(audio: ${safeName(a.title) ?? name ?? 'audio'})`, undefined, {
+  const transcript = await transcribeTgVoice(a.file_id)
+  const cap = ctx.message.caption ? `\n\n${ctx.message.caption}` : ''
+  const content = transcript
+    ? `🎙 (аудио, расшифровка):\n${transcript}${cap}`
+    : (ctx.message.caption ?? `(audio: ${safeName(a.title) ?? name ?? 'audio'})`)
+  await handleInbound(ctx, content, undefined, {
     kind: 'audio', file_id: a.file_id, size: a.file_size, mime: a.mime_type, name,
   })
 })

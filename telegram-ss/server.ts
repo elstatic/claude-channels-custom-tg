@@ -653,7 +653,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
               try {
                 await bot.api.editMessageText(chat_id, statusMsgId, chunks[i], {
                   ...(parseMode ? { parse_mode: parseMode } : {}),
-                })
+                  // Drop the ⏹ Стоп button — the bubble is now the final answer.
+                  reply_markup: { inline_keyboard: [] },
+                } as any)
                 sentIds.push(statusMsgId)
                 continue
               } catch {
