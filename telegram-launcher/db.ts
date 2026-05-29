@@ -57,6 +57,17 @@ export class TopicDb {
     return rows.reverse()
   }
 
+  // Full-text-ish search across all topics (newest first). LIKE with escaping
+  // so %, _ and \ in the query are treated literally.
+  search(query: string, limit = 10): StoredMsg[] {
+    const escaped = query.replace(/[\\%_]/g, m => '\\' + m)
+    return this.db
+      .query(
+        "SELECT thread_id, role, text, ts, message_id FROM messages WHERE text LIKE ? ESCAPE '\\' ORDER BY ts DESC, id DESC LIMIT ?",
+      )
+      .all(`%${escaped}%`, limit) as StoredMsg[]
+  }
+
   count(threadId: number): number {
     const row = this.db
       .query('SELECT COUNT(*) AS n FROM messages WHERE thread_id = ?')

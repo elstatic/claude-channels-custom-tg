@@ -266,6 +266,43 @@ function notifyOwner(text: string): void {
   } catch {}
 }
 
+// Best-effort token usage for a topic, summed from its newest CC transcript
+// (~/.claude/projects/<encoded-cwd>/<session>.jsonl). No dollar figure — token
+// pricing varies by model; we report raw token totals which are unambiguous.
+function readSessionUsage(threadId: number): { input: number; output: number; cacheRead: number; cacheWrite: number; turns: number } | null {
+  try {
+    const projRoot = join(homedir(), '.claude', 'projects')
+    const dirs = readdirSync(projRoot).filter(d => d.endsWith(`-topic-${threadId}`))
+    let best: { path: string; mtime: number } | null = null
+    for (const d of dirs) {
+      try {
+        for (const f of readdirSync(join(projRoot, d))) {
+          if (!f.endsWith('.jsonl')) continue
+          const p = join(projRoot, d, f)
+          const st = statSync(p)
+          if (!best || st.mtimeMs > best.mtime) best = { path: p, mtime: st.mtimeMs }
+        }
+      } catch {}
+    }
+    if (!best) return null
+    const u = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, turns: 0 }
+    for (const ln of readFileSync(best.path, 'utf8').split('\n')) {
+      if (!ln.trim()) continue
+      let o: any
+      try { o = JSON.parse(ln) } catch { continue }
+      const us = o?.message?.usage
+      if (o?.type === 'assistant' && us) {
+        u.input += us.input_tokens || 0
+        u.output += us.output_tokens || 0
+        u.cacheRead += us.cache_read_input_tokens || 0
+        u.cacheWrite += us.cache_creation_input_tokens || 0
+        u.turns++
+      }
+    }
+    return u
+  } catch { return null }
+}
+
 function checkApprovals(): void {
   let files: string[]
   try { files = readdirSync(APPROVED_DIR) } catch { return }
@@ -1176,6 +1213,72 @@ bot.command('health', async ctx => {
   await ctx.reply(lines.join('\n'), { message_thread_id: contextThreadId(ctx) || undefined })
 })
 
+function relFuture(ms: number): string {
+  const s = Math.floor((ms - Date.now()) / 1000)
+  if (s < 0) return 'скоро'
+  if (s < 3600) return `через ${Math.max(1, Math.floor(s / 60))}м`
+  if (s < 86400) return `через ${Math.floor(s / 3600)}ч`
+  return `через ${Math.floor(s / 86400)}д`
+}
+
+bot.command('jobs', async ctx => {
+  const gated = dmCommandGate(ctx)
+  if (!gated || !gated.access.allowFrom.includes(gated.senderId)) return
+  const all = jobs.all().slice().sort((a, b) => a.nextFireAt - b.nextFireAt)
+  const tid = contextThreadId(ctx) || undefined
+  if (all.length === 0) { await ctx.reply('🗓 Нет задач в расписании.', { message_thread_id: tid }); return }
+  const lines = all.map(j => {
+    const p = j.prompt.replace(/\s+/g, ' ').slice(0, 60)
+    return `• ${j.id} — ${j.oneShot ? '1× ' : j.cron + ' '}(${relFuture(j.nextFireAt)})\n  ${p}${j.prompt.length > 60 ? '…' : ''}`
+  })
+  await ctx.reply(`🗓 Задачи (${all.length}):\n\n${lines.join('\n')}\n\nОтмена: /cancel <id>`, { message_thread_id: tid })
+})
+
+bot.command('cancel', async ctx => {
+  const gated = dmCommandGate(ctx)
+  if (!gated || !gated.access.allowFrom.includes(gated.senderId)) return
+  const id = String(ctx.match ?? '').trim()
+  const tid = contextThreadId(ctx) || undefined
+  if (!id) { await ctx.reply('Использование: /cancel <id> (список — /jobs)', { message_thread_id: tid }); return }
+  const ok = jobs.remove(id)
+  await ctx.reply(ok ? `✅ Задача ${id} отменена.` : `Задача ${id} не найдена.`, { message_thread_id: tid })
+})
+
+bot.command('search', async ctx => {
+  const gated = dmCommandGate(ctx)
+  if (!gated || !gated.access.allowFrom.includes(gated.senderId)) return
+  const q = String(ctx.match ?? '').trim()
+  const tid = contextThreadId(ctx) || undefined
+  if (!q) { await ctx.reply('Использование: /search <текст>', { message_thread_id: tid }); return }
+  const rows = db.search(q, 10)
+  if (rows.length === 0) { await ctx.reply(`🔎 Ничего не найдено по «${q}».`, { message_thread_id: tid }); return }
+  const lines = rows.map(r => {
+    const who = r.role === 'user' ? '🧑' : '🤖'
+    let t = r.text.replace(/\s+/g, ' ').trim()
+    if (t.length > 110) t = t.slice(0, 110) + '…'
+    return `${who} [t${r.thread_id}] ${fmtAgo(r.ts)}\n${t}`
+  })
+  await ctx.reply(`🔎 «${q}» — ${rows.length}:\n\n${lines.join('\n\n')}`, { message_thread_id: tid })
+})
+
+bot.command('cost', async ctx => {
+  const gated = dmCommandGate(ctx)
+  if (!gated || !gated.access.allowFrom.includes(gated.senderId)) return
+  const tid = contextThreadId(ctx) || undefined
+  const t = contextThreadId(ctx)
+  const usage = readSessionUsage(t)
+  if (!usage) { await ctx.reply('Не нашёл транскрипт сессии для подсчёта.', { message_thread_id: tid }); return }
+  const k = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n)
+  await ctx.reply(
+    `💰 Токены этой сессии (из транскрипта):\n` +
+    `• вход: ${k(usage.input)}\n` +
+    `• выход: ${k(usage.output)}\n` +
+    `• кэш (чтение/запись): ${k(usage.cacheRead)} / ${k(usage.cacheWrite)}\n` +
+    `• сообщений ассистента: ${usage.turns}`,
+    { message_thread_id: tid },
+  )
+})
+
 bot.command('stop', async ctx => {
   const gated = dmCommandGate(ctx)
   if (!gated || !gated.access.allowFrom.includes(gated.senderId)) return
@@ -1706,6 +1809,10 @@ void (async () => {
             { command: 'clear', description: 'Clear context' },
             { command: 'resume', description: 'Resume conversation' },
             { command: 'interrupt', description: 'Interrupt (Esc)' },
+            { command: 'jobs', description: 'List scheduled tasks' },
+            { command: 'cancel', description: 'Cancel a scheduled task: /cancel <id>' },
+            { command: 'search', description: 'Search history: /search <text>' },
+            { command: 'cost', description: 'Token usage of this session' },
             { command: 'stop', description: 'Kill Claude session in this topic' },
           ], { scope: { type: 'all_private_chats' } }).catch(() => {})
         },
