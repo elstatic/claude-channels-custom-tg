@@ -24,6 +24,7 @@ import type { ReactionTypeEmoji } from 'grammy/types'
 import { spawn, spawnSync } from 'child_process'
 import {
   readFileSync, writeFileSync, mkdirSync, chmodSync, renameSync, readdirSync, rmSync, statSync,
+  openSync, readSync, fstatSync, closeSync,
 } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
@@ -937,13 +938,72 @@ function statusKeyboard(threadId: number): InlineKeyboard {
   return new InlineKeyboard().text('⏹ Стоп', `stopturn:${threadId}`)
 }
 
+function isRealUserMsg(o: any): boolean {
+  if (o?.type !== 'user') return false
+  const c = o?.message?.content
+  if (typeof c === 'string') return true
+  if (Array.isArray(c)) return !c.some((b: any) => b?.type === 'tool_result')
+  return false
+}
+
+// Read the agent's CURRENT reasoning at render time (not at tool-fire time, when
+// CC hasn't flushed the text block yet — that lag is why the hook missed it).
+// Newest transcript for this topic → nearest text block (fallback thinking),
+// stopping at the last real user message. Tail-read only, for speed.
+function readLatestNarration(threadId: number): string {
+  try {
+    const projRoot = join(homedir(), '.claude', 'projects')
+    const dirs = readdirSync(projRoot).filter(d => d.endsWith(`-topic-${threadId}`))
+    let best: { path: string; mtime: number } | null = null
+    for (const d of dirs) {
+      try {
+        for (const f of readdirSync(join(projRoot, d))) {
+          if (!f.endsWith('.jsonl')) continue
+          const p = join(projRoot, d, f)
+          const st = statSync(p)
+          if (!best || st.mtimeMs > best.mtime) best = { path: p, mtime: st.mtimeMs }
+        }
+      } catch {}
+    }
+    if (!best) return ''
+    const fd = openSync(best.path, 'r')
+    let tail = ''
+    try {
+      const size = fstatSync(fd).size
+      const len = Math.min(size, 131072)
+      const buf = Buffer.allocUnsafe(len)
+      readSync(fd, buf, 0, len, size - len)
+      tail = buf.toString('utf8')
+    } finally { closeSync(fd) }
+    const objs: any[] = []
+    for (const ln of tail.split('\n')) { try { objs.push(JSON.parse(ln)) } catch {} }
+    let textHit: string | null = null, thinkHit: string | null = null
+    for (let i = objs.length - 1; i >= 0; i--) {
+      const o = objs[i]
+      if (isRealUserMsg(o)) break
+      if (o?.type !== 'assistant') continue
+      for (const b of o?.message?.content ?? []) {
+        if (b?.type === 'text' && (b.text || '').trim() && textHit === null) textHit = b.text
+        else if (b?.type === 'thinking' && (b.thinking || '').trim() && thinkHit === null) thinkHit = b.thinking
+      }
+      if (textHit) break
+    }
+    const s = (textHit ?? thinkHit ?? '').replace(/\s+/g, ' ').trim()
+    return s.length > 120 ? s.slice(0, 119) + '…' : s
+  } catch { return '' }
+}
+
 function renderStatus(threadId: number, dots: string): string {
   const head = '💬 ' + dots
   let trace = ''
   try { trace = readFileSync(traceFile(threadId), 'utf8').trim() } catch {}
-  if (!trace) return head
-  const lines = trace.split('\n').filter(Boolean).slice(-10).map(htmlEscape).join('\n')
-  return head + '\n<blockquote expandable>' + lines + '</blockquote>'
+  const cmdLines = trace ? trace.split('\n').filter(Boolean).slice(-8) : []
+  const narr = readLatestNarration(threadId)
+  const block: string[] = []
+  if (narr) block.push('💭 ' + narr)
+  block.push(...cmdLines)
+  if (block.length === 0) return head
+  return head + '\n<blockquote expandable>' + block.map(htmlEscape).join('\n') + '</blockquote>'
 }
 
 // null = no file; true/false = consumed flag.
@@ -991,7 +1051,7 @@ async function startStatusMessage(threadId: number, chatId: number): Promise<voi
       parse_mode: 'HTML',
       reply_markup: statusKeyboard(threadId),
     } as any).catch(() => {})
-  }, 3500)
+  }, 2500)
   statusMessages.set(threadId, entry)
 }
 
