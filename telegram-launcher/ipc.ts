@@ -29,9 +29,12 @@ export type HistoryLogMsg = {
   text: string
   message_id?: number
 }
+// reply() is about to morph the status bubble into the answer — stop the
+// dispatcher's animator synchronously so it can't clobber the final text.
+export type StatusConsumeMsg = { type: 'status_consume'; thread_id: number }
 
 export type DispatcherToMcp = InboundMsg | TuiSendMsg | WatchDialogMsg
-export type McpToDispatcher = RegisterMsg | OutboundDialogMsg | PermissionReplyMsg | TopicDeletedMsg | HistoryLogMsg
+export type McpToDispatcher = RegisterMsg | OutboundDialogMsg | PermissionReplyMsg | TopicDeletedMsg | HistoryLogMsg | StatusConsumeMsg
 
 // Line-buffered JSON reader. Calls handler(json) for each complete message.
 export function attachLineReader(sock: net.Socket, handler: (line: string) => void) {

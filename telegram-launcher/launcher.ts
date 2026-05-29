@@ -242,6 +242,30 @@ function dmCommandGate(ctx: Context): { access: Access; senderId: string } | nul
 
 // ── Approvals polling (skill drops file at approved/<senderId>) ───────────
 const bot = new Bot(TOKEN)
+
+// ── Observability ─────────────────────────────────────────────────────────
+// The operator is on a phone and will never read journald. Track liveness and
+// DM the owner when something goes wrong, plus a /health command on demand.
+const BOOT_AT = Date.now()
+let lastUpdateAt = 0
+bot.use(async (_ctx, next) => { lastUpdateAt = Date.now(); await next() })
+
+function fmtAgo(ms: number): string {
+  if (!ms) return 'never'
+  const s = Math.floor((Date.now() - ms) / 1000)
+  if (s < 60) return `${s}s ago`
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`
+  return `${Math.floor(s / 3600)}h ago`
+}
+
+// DM the first allowlisted user. Fire-and-forget; never throws.
+function notifyOwner(text: string): void {
+  try {
+    const owner = loadAccess().allowFrom[0]
+    if (owner) void bot.api.sendMessage(owner, text).catch(() => {})
+  } catch {}
+}
+
 function checkApprovals(): void {
   let files: string[]
   try { files = readdirSync(APPROVED_DIR) } catch { return }
@@ -384,6 +408,8 @@ function killSession(threadId: number, opts?: { silent?: boolean }): void {
     }, 1000)
   }
   registry.remove(threadId)
+  stopStatusMessage(threadId)
+  cleanupCoordFiles(threadId)
 }
 
 // ── Topic-existence probe ─────────────────────────────────────────────────
@@ -432,11 +458,13 @@ const INBOX_DIR_HYGIENE = join(STATE_DIR, 'inbox')
 
 async function sweepDiskHygiene(): Promise<void> {
   const now = Date.now()
-  // /tmp/claude-spawn-t*.log
+  // /tmp/claude-spawn-t*.log and the status/trace coordination files (cleaned
+  // on session death too, but this is the backstop for orphans / crashes).
   try {
     const entries = readdirSync('/tmp')
     for (const name of entries) {
-      if (!/^claude-spawn(-t\d+)?\.log$/.test(name)) continue
+      if (!/^claude-spawn(-t\d+)?\.log$/.test(name) &&
+          !/^claude-tg-(status|trace)-\d+\.(json|txt)$/.test(name)) continue
       const path = '/tmp/' + name
       try {
         const st = statSync(path)
@@ -707,6 +735,12 @@ createIpcServer({
       }
       return
     }
+    if (msg.type === 'status_consume') {
+      // reply() claimed the status bubble — stop the animator synchronously
+      // (same process, no race) so it can't overwrite the final answer.
+      stopStatusMessage(msg.thread_id)
+      return
+    }
   },
   onDisconnect(sock) {
     const threadId = registry.detachSocket(sock)
@@ -836,6 +870,24 @@ function traceFile(threadId: number): string {
   return `/tmp/claude-tg-trace-${threadId}.txt`
 }
 
+// Atomic write so the launcher / server.ts / hooks never read a torn file.
+function atomicWrite(path: string, data: string): void {
+  const tmp = `${path}.tmp.${process.pid}.${Date.now()}`
+  try {
+    writeFileSync(tmp, data)
+    renameSync(tmp, path)
+  } catch {
+    try { rmSync(tmp, { force: true }) } catch {}
+  }
+}
+
+// Remove a topic's coordination files (status + trace) on session death so
+// /tmp doesn't accumulate one pair per thread forever.
+function cleanupCoordFiles(threadId: number): void {
+  try { rmSync(statusFile(threadId), { force: true }) } catch {}
+  try { rmSync(traceFile(threadId), { force: true }) } catch {}
+}
+
 function htmlEscape(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 }
@@ -867,7 +919,7 @@ async function startStatusMessage(threadId: number, chatId: number): Promise<voi
   if (statusMessages.has(threadId) && statusConsumed(threadId) === false) return
   stopStatusMessage(threadId)
   // Fresh working bubble → fresh trace (don't carry over the previous turn's).
-  try { writeFileSync(traceFile(threadId), '') } catch {}
+  atomicWrite(traceFile(threadId), '')
   let messageId: number
   try {
     // Always ship at least one dot — a lone 💬 is a single-emoji message, which
@@ -878,16 +930,17 @@ async function startStatusMessage(threadId: number, chatId: number): Promise<voi
     } as any)
     messageId = sent.message_id
   } catch { return }
-  try {
-    writeFileSync(statusFile(threadId), JSON.stringify({
-      chat_id: chatId, thread_id: threadId, message_id: messageId, consumed: false,
-    }))
-  } catch {}
+  atomicWrite(statusFile(threadId), JSON.stringify({
+    chat_id: chatId, thread_id: threadId, message_id: messageId, consumed: false,
+  }))
   const entry: StatusEntry = { messageId, chatId, dot: 0, startedAt: Date.now(), timer: undefined as any }
   entry.timer = setInterval(() => {
     // Self-stop once server.ts/the hook took over (consumed) or after the cap.
     if (statusConsumed(threadId) !== false || Date.now() - entry.startedAt > STATUS_MAX_MS) {
+      const capped = Date.now() - entry.startedAt > STATUS_MAX_MS
       stopStatusMessage(threadId)
+      // On the time cap, mark consumed so a late reply doesn't edit a dead bubble.
+      if (capped) { try { atomicWrite(statusFile(threadId), JSON.stringify({ chat_id: chatId, thread_id: threadId, message_id: messageId, consumed: true })) } catch {} }
       return
     }
     entry.dot = (entry.dot + 1) % STATUS_DOTS.length
@@ -1096,6 +1149,24 @@ bot.command('resume', async ctx => {
   ipcSend(rec.threadId, { type: 'tui_send', mode: 'slash', payload: '/resume' })
   ipcSend(rec.threadId, { type: 'watch_dialog' })
   await ctx.reply('Sent /resume.', { message_thread_id: contextThreadId(ctx) || undefined })
+})
+
+bot.command('health', async ctx => {
+  const gated = dmCommandGate(ctx)
+  if (!gated || !gated.access.allowFrom.includes(gated.senderId)) return
+  const live = registry.all().filter(r => r.socket)
+  const pendingJobs = jobs.all().length
+  const up = Math.floor((Date.now() - BOOT_AT) / 1000)
+  const upStr = up < 3600 ? `${Math.floor(up / 60)}m` : `${Math.floor(up / 3600)}h ${Math.floor((up % 3600) / 60)}m`
+  const lines = [
+    `🩺 Диспетчер жив`,
+    `• аптайм: ${upStr}`,
+    `• последний апдейт из Telegram: ${fmtAgo(lastUpdateAt)}`,
+    `• живых сессий: ${live.length}${live.length ? ' (' + live.map(r => r.threadId).join(', ') + ')' : ''}`,
+    `• задач в расписании: ${pendingJobs}`,
+    `• бот: @${botUsername ?? '?'}`,
+  ]
+  await ctx.reply(lines.join('\n'), { message_thread_id: contextThreadId(ctx) || undefined })
 })
 
 bot.command('stop', async ctx => {
@@ -1532,13 +1603,17 @@ void (async () => {
     try {
       await bot.start({
         onStart: info => {
+          const wasDown = attempt > 1
           attempt = 0
           botUsername = info.username
           process.stderr.write(`telegram-dispatcher: polling as @${info.username}\n`)
+          // Tell the owner the bridge is back (boot or recovery from an outage).
+          notifyOwner(wasDown ? `✅ Бридж восстановился, поллинг возобновлён (@${info.username}).` : `✅ Диспетчер запущен, поллинг активен (@${info.username}).`)
           void bot.api.setMyCommands([
             { command: 'start', description: 'Welcome and setup guide' },
             { command: 'help', description: 'What this bot can do' },
             { command: 'status', description: 'Check your pairing state' },
+            { command: 'health', description: 'Dispatcher health' },
             { command: 'effort', description: 'Set thinking effort' },
             { command: 'model', description: 'Pick model' },
             { command: 'mode', description: 'Cycle permission mode' },
@@ -1558,6 +1633,10 @@ void (async () => {
       process.stderr.write(
         `telegram-dispatcher: ${is409 ? '409 Conflict' : 'polling error'}: ${err}, retrying in ${delay / 1000}s\n`,
       )
+      // After a few failed attempts, alert the owner — the bridge is wedged.
+      if (attempt === 4) {
+        notifyOwner(`⚠️ Поллинг падает (${is409 ? '409 Conflict — другой инстанс?' : 'сетевая ошибка/прокси'}). Повторяю каждые ~${delay / 1000}s.`)
+      }
       await new Promise(r => setTimeout(r, delay))
     }
   }

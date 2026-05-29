@@ -18,7 +18,7 @@ import {
 import { z } from 'zod'
 import { Bot, InlineKeyboard, InputFile } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
-import { readFileSync, writeFileSync, mkdirSync, statSync, realpathSync, chmodSync } from 'fs'
+import { readFileSync, writeFileSync, renameSync, mkdirSync, statSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
 import { connectToIpc } from '../telegram-launcher/ipc'
@@ -348,7 +348,12 @@ function consumeStatusMessage(): number | null {
   try {
     const o = JSON.parse(readFileSync(f, 'utf8'))
     if (o && o.consumed === false && typeof o.message_id === 'number') {
-      writeFileSync(f, JSON.stringify({ ...o, consumed: true }))
+      // Atomic write so the launcher animator / Stop hook never read a torn file.
+      const tmp = `${f}.tmp.${process.pid}`
+      try { writeFileSync(tmp, JSON.stringify({ ...o, consumed: true })); renameSync(tmp, f) } catch {}
+      // Tell the dispatcher to stop the animator synchronously (kills the race
+      // where an in-flight animator edit clobbers the answer we're about to write).
+      try { ipcClient?.send({ type: 'status_consume', thread_id: THREAD_ID }) } catch {}
       return o.message_id
     }
   } catch {}
