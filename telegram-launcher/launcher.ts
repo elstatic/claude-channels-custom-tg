@@ -999,11 +999,16 @@ function renderStatus(threadId: number, dots: string): string {
   try { trace = readFileSync(traceFile(threadId), 'utf8').trim() } catch {}
   const cmdLines = trace ? trace.split('\n').filter(Boolean).slice(-8) : []
   const narr = readLatestNarration(threadId)
+  // Lines are pre-escaped individually (the id line carries intentional <code>),
+  // then joined raw — so DON'T map htmlEscape over the whole block again.
   const block: string[] = []
-  if (narr) block.push('💭 ' + narr)
-  block.push(...cmdLines)
-  if (block.length === 0) return head
-  return head + '\n<blockquote expandable>' + block.map(htmlEscape).join('\n') + '</blockquote>'
+  // Copyable topic id — first line so it stays visible even in the collapsed
+  // grey quote. Lets the user grab the topic number from a stuck/working bubble
+  // (often the only message present when a session goes silent) to report it.
+  block.push(`🧵 <code>${threadId}</code>`)
+  if (narr) block.push('💭 ' + htmlEscape(narr))
+  block.push(...cmdLines.map(htmlEscape))
+  return head + '\n<blockquote expandable>' + block.join('\n') + '</blockquote>'
 }
 
 // null = no file; true/false = consumed flag.

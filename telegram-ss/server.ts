@@ -71,6 +71,28 @@ function threadOpt<T extends object>(extra?: T): T & { message_thread_id?: numbe
   return { ...(extra ?? ({} as T)), message_thread_id: THREAD_ID || undefined }
 }
 
+// Append a tap-to-copy topic-id footer to a reply chunk, so the user can grab
+// the topic number off any answer to report "something's wrong in topic X".
+// Plain-text path uses an explicit `code` entity (no escaping of the body —
+// JS string length is UTF-16, matching Telegram's entity offset units).
+// MarkdownV2 path appends inline code instead, since entities can't combine
+// with parse_mode. No-op when there's no topic (THREAD_ID 0).
+function withTopicTag(
+  s: string,
+  parseMode?: 'MarkdownV2',
+): { text: string; entities?: any[] } {
+  if (!THREAD_ID) return { text: s }
+  const id = String(THREAD_ID)
+  if (parseMode === 'MarkdownV2') {
+    return { text: `${s}\n\n🧵 \`${id}\`` }
+  }
+  const prefix = `${s}\n\n🧵 `
+  return {
+    text: prefix + id,
+    entities: [{ type: 'code', offset: prefix.length, length: id.length }],
+  }
+}
+
 // Last-resort safety net — without these the process dies silently on any
 // unhandled promise rejection. With them it logs and keeps serving tools.
 process.on('unhandledRejection', err => {
@@ -649,10 +671,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
               reply_to != null &&
               replyMode !== 'off' &&
               (replyMode === 'all' || i === 0)
+            // Tap-to-copy topic-id footer on the LAST chunk only (one per answer).
+            const tagged = i === chunks.length - 1
+              ? withTopicTag(chunks[i], parseMode)
+              : { text: chunks[i] as string, entities: undefined as any[] | undefined }
             if (i === 0 && statusMsgId != null) {
               try {
-                await bot.api.editMessageText(chat_id, statusMsgId, chunks[i], {
+                await bot.api.editMessageText(chat_id, statusMsgId, tagged.text, {
                   ...(parseMode ? { parse_mode: parseMode } : {}),
+                  ...(tagged.entities ? { entities: tagged.entities } : {}),
                   // Drop the ⏹ Стоп button — the bubble is now the final answer.
                   reply_markup: { inline_keyboard: [] },
                 } as any)
@@ -663,10 +690,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
                 // so the reply still lands.
               }
             }
-            const sent = await bot.api.sendMessage(chat_id, chunks[i], {
+            const sent = await bot.api.sendMessage(chat_id, tagged.text, {
               ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
               ...(parseMode ? { parse_mode: parseMode } : {}),
-            }, AbortSignal.timeout(SEND_TIMEOUT_MS))
+              ...(tagged.entities ? { entities: tagged.entities } : {}),
+            } as any, AbortSignal.timeout(SEND_TIMEOUT_MS))
             sentIds.push(sent.message_id)
           }
         } catch (err) {
