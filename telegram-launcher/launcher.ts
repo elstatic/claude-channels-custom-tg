@@ -22,6 +22,7 @@
 import { Bot, GrammyError, InlineKeyboard, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { spawn, spawnSync } from 'child_process'
+import { parsePaneThinking } from './pane'
 import {
   readFileSync, writeFileSync, mkdirSync, chmodSync, renameSync, readdirSync, rmSync, statSync,
   openSync, readSync, fstatSync, closeSync,
@@ -770,6 +771,11 @@ createIpcServer({
           ts: Date.now(),
           message_id: msg.message_id ?? null,
         })
+        // A reply was delivered → freeze the working log here (stops the edit
+        // loop and drops its ⏹ button) so the answer reads as its own separate
+        // message below it. (New server.ts also sends status_consume earlier;
+        // this is the version-independent backstop.) No auto-resume this turn.
+        stopStatusMessage(threadId)
       }
       return
     }
@@ -895,7 +901,12 @@ function stopSpawnTyping(threadId: number): void {
 // once consumed, the animator below self-stops so it never clobbers the answer.
 const STATUS_DOTS = ['.', '..', '...', '....', '.....']
 const STATUS_MAX_MS = 10 * 60_000
-type StatusEntry = { messageId: number; chatId: number; timer: ReturnType<typeof setInterval>; dot: number; startedAt: number }
+// Edit cadence for the growing working-log message. ~1.8s reads as calm/CLI-like
+// and stays near Telegram's edit ceiling; 429s back off via retry_after below.
+const STATUS_TICK_MS = 1800
+// Braille spinner for the live cursor line (one frame per tick).
+const SPIN_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+type StatusEntry = { messageId: number; chatId: number; timer: ReturnType<typeof setInterval>; dot: number; startedAt: number; skipUntil?: number }
 const statusMessages = new Map<number, StatusEntry>()
 
 function statusFile(threadId: number): string {
@@ -906,6 +917,24 @@ function statusFile(threadId: number): string {
 // render it as an expandable blockquote under the "работаю" line.
 function traceFile(threadId: number): string {
   return `/tmp/claude-tg-trace-${threadId}.txt`
+}
+
+// The currently-RUNNING tool, written by the PreToolUse hook and cleared on
+// PostToolUse. Rendered with a blinking marker so long calls visibly "work".
+function activeFile(threadId: number): string {
+  return `/tmp/claude-tg-active-${threadId}.txt`
+}
+
+// Lift the agent's live reasoning straight off the Claude Code TUI by scraping
+// its tmux pane (session name mirrors spawnSession: claude_t<thread>). Pure
+// parsing lives in pane.ts; here we just run capture-pane and hand it over.
+function tmuxThinking(threadId: number): { statusWord: string; lines: string[] } {
+  try {
+    const r = spawnSync('tmux', ['capture-pane', '-p', '-t', `claude_t${threadId}:0.0`],
+      { encoding: 'utf8', timeout: 1500, maxBuffer: 1 << 20 })
+    if (r.status !== 0 || !r.stdout) return { statusWord: '', lines: [] }
+    return parsePaneThinking(r.stdout)
+  } catch { return { statusWord: '', lines: [] } }
 }
 
 // Atomic write so the launcher / server.ts / hooks never read a torn file.
@@ -924,6 +953,7 @@ function atomicWrite(path: string, data: string): void {
 function cleanupCoordFiles(threadId: number): void {
   try { rmSync(statusFile(threadId), { force: true }) } catch {}
   try { rmSync(traceFile(threadId), { force: true }) } catch {}
+  try { rmSync(activeFile(threadId), { force: true }) } catch {}
 }
 
 function htmlEscape(s: string): string {
@@ -993,22 +1023,36 @@ function readLatestNarration(threadId: number): string {
   } catch { return '' }
 }
 
-function renderStatus(threadId: number, dots: string): string {
-  const head = '💬 ' + dots
+// CLI/desktop-style working log rendered into ONE message that GROWS in place
+// (edited, append-only): finished tool calls accumulate as ⏺ lines and are never
+// overwritten. The last line is a single live cursor — the running tool (⏺ …
+// spinner) wins; between tools it's the current thought (💭 spinner). HTML so the
+// debug id is tap-to-copy; dynamic text is escaped. `tick` drives the spinner.
+function renderStatus(threadId: number, tick: number): string {
+  const spin = SPIN_FRAMES[tick % SPIN_FRAMES.length]
+  const lines: string[] = [`debug topic id: <code>${threadId}</code>`]
+
+  // Append-only log of finished tool calls (trace is written in order by the
+  // PostToolUse hook). Cap the tail to keep the message under Telegram's 4096.
   let trace = ''
   try { trace = readFileSync(traceFile(threadId), 'utf8').trim() } catch {}
-  const cmdLines = trace ? trace.split('\n').filter(Boolean).slice(-8) : []
-  const narr = readLatestNarration(threadId)
-  // Lines are pre-escaped individually (the id line carries intentional <code>),
-  // then joined raw — so DON'T map htmlEscape over the whole block again.
-  const block: string[] = []
-  // Copyable topic id — first line so it stays visible even in the collapsed
-  // grey quote. Lets the user grab the topic number from a stuck/working bubble
-  // (often the only message present when a session goes silent) to report it.
-  block.push(`🧵 <code>${threadId}</code>`)
-  if (narr) block.push('💭 ' + htmlEscape(narr))
-  block.push(...cmdLines.map(htmlEscape))
-  return head + '\n<blockquote expandable>' + block.join('\n') + '</blockquote>'
+  const done = trace ? trace.split('\n').filter(Boolean).slice(-14) : []
+  for (const d of done) lines.push(htmlEscape(d.replace(/^•\s/, '⏺ ')))
+
+  // Single live trailing line: the currently-running tool, else the thought.
+  let active = ''
+  try { active = readFileSync(activeFile(threadId), 'utf8').trim() } catch {}
+  if (active) {
+    lines.push(`⏺ ${htmlEscape(active)} ${spin}`)
+  } else {
+    const pane = tmuxThinking(threadId)
+    let thought = pane.lines.length ? pane.lines[pane.lines.length - 1] : ''
+    if (!thought) thought = readLatestNarration(threadId) // transcript fallback
+    // "Crunched for …" is CC's idle caption, not a live action — skip it.
+    if (!thought && pane.statusWord && !/^Crunch/i.test(pane.statusWord)) thought = pane.statusWord
+    lines.push(`💭 ${spin}${thought ? ' ' + htmlEscape(thought) : ''}`)
+  }
+  return lines.join('\n')
 }
 
 // null = no file; true/false = consumed flag.
@@ -1021,48 +1065,65 @@ function statusConsumed(threadId: number): boolean | null {
 
 async function startStatusMessage(threadId: number, chatId: number): Promise<void> {
   if (!threadId) return
-  // Reuse an existing, still-active status message (rapid-fire inbound) instead
-  // of stacking a second "работаю…" bubble in the topic.
+  // Reuse an existing, still-active working message (rapid-fire inbound) instead
+  // of posting a second log into the same topic.
   if (statusMessages.has(threadId) && statusConsumed(threadId) === false) return
   stopStatusMessage(threadId)
-  // Fresh working bubble → fresh trace (don't carry over the previous turn's).
+  // Fresh turn → fresh trace + no stale running-tool marker.
   atomicWrite(traceFile(threadId), '')
+  try { rmSync(activeFile(threadId), { force: true }) } catch {}
+  // Post the working-log message with the inline ⏹ button, then grow it in place.
   let messageId: number
   try {
-    // Always ship at least one dot — a lone 💬 is a single-emoji message, which
-    // Telegram renders as a jumbo emoji (looks broken). The animator takes over
-    // ~3.5s later; until then this is what the user sees.
-    const sent = await bot.api.sendMessage(chatId, '💬 .', {
+    const sent = await bot.api.sendMessage(chatId, renderStatus(threadId, 0), {
       message_thread_id: threadId || undefined,
+      parse_mode: 'HTML',
       reply_markup: statusKeyboard(threadId),
     } as any)
     messageId = sent.message_id
   } catch { return }
+  // Deliberately NO message_id in the status file: that keeps reply()/ensure
+  // -delivery from "morphing" this working log into the answer (any server.ts
+  // version) — the answer must be a separate message. The launcher edits the log
+  // via the in-memory entry below; `consumed` gates the loop + the Stop hook.
   atomicWrite(statusFile(threadId), JSON.stringify({
-    chat_id: chatId, thread_id: threadId, message_id: messageId, consumed: false,
+    chat_id: chatId, thread_id: threadId, consumed: false,
   }))
   const entry: StatusEntry = { messageId, chatId, dot: 0, startedAt: Date.now(), timer: undefined as any }
   entry.timer = setInterval(() => {
-    // Self-stop once server.ts/the hook took over (consumed) or after the cap.
+    // Self-stop once server.ts/the Stop hook took over (consumed) or after the cap.
     if (statusConsumed(threadId) !== false || Date.now() - entry.startedAt > STATUS_MAX_MS) {
       const capped = Date.now() - entry.startedAt > STATUS_MAX_MS
       stopStatusMessage(threadId)
-      // On the time cap, mark consumed so a late reply doesn't edit a dead bubble.
-      if (capped) { try { atomicWrite(statusFile(threadId), JSON.stringify({ chat_id: chatId, thread_id: threadId, message_id: messageId, consumed: true })) } catch {} }
+      if (capped) { try { atomicWrite(statusFile(threadId), JSON.stringify({ chat_id: chatId, thread_id: threadId, consumed: true })) } catch {} }
       return
     }
-    entry.dot = (entry.dot + 1) % STATUS_DOTS.length
-    void bot.api.editMessageText(chatId, messageId, renderStatus(threadId, STATUS_DOTS[entry.dot]), {
+    // Honour a 429 back-off window before spending another edit.
+    if (entry.skipUntil && Date.now() < entry.skipUntil) return
+    entry.dot = (entry.dot + 1) % 600 // free-running tick (spinner)
+    void bot.api.editMessageText(chatId, messageId, renderStatus(threadId, entry.dot), {
       parse_mode: 'HTML',
       reply_markup: statusKeyboard(threadId),
-    } as any).catch(() => {})
-  }, 2500)
+    } as any).catch((e: any) => {
+      const ra = e?.parameters?.retry_after ?? (e instanceof GrammyError ? e.parameters?.retry_after : undefined)
+      if (ra) entry.skipUntil = Date.now() + (ra * 1000) + 250
+    })
+  }, STATUS_TICK_MS)
   statusMessages.set(threadId, entry)
 }
 
 function stopStatusMessage(threadId: number): void {
   const e = statusMessages.get(threadId)
-  if (e) { clearInterval(e.timer); statusMessages.delete(threadId) }
+  if (!e) return
+  clearInterval(e.timer)
+  statusMessages.delete(threadId)
+  // Turn finished → strip the ⏹ button from the working log (it stays as a plain
+  // CLI-style transcript; the answer arrives as its own separate message).
+  if (e.messageId) {
+    void bot.api.editMessageReplyMarkup(e.chatId, e.messageId, {
+      reply_markup: { inline_keyboard: [] },
+    } as any).catch(() => {})
+  }
 }
 
 function startSpawnTimeout(threadId: number, chatId: number): void {
@@ -1241,6 +1302,9 @@ bot.command('interrupt', async ctx => {
   const rec = await requireSession(ctx)
   if (!rec) return
   ipcSend(rec.threadId, { type: 'tui_send', mode: 'keys', payload: ['Escape'] })
+  // Interrupt has no reply/Stop-hook to mark the turn consumed, so stop the live
+  // draft loop here — otherwise it keeps streaming the frozen pane until the cap.
+  stopStatusMessage(rec.threadId)
   await ctx.reply('Sent Esc.', { message_thread_id: contextThreadId(ctx) || undefined })
 })
 

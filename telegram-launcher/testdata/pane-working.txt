@@ -1,0 +1,24 @@
+  plan:
+
+  Called telegram-ss (ctrl+o to expand)
+
+● Approved. Let me set up tasks and start implementing — first grounding the
+  parser in a real, clean pane capture and confirming the exact session-name
+  derivation.
+
+  Bash(mkdir -p
+      /home/clawd/.openclaw/workspace/plugins/telegram-launcher/testdata
+      for s in claude_t129546 claude_t129574; do…)
+  ⎿  Running…
+
+✢ Building pane thinking parser… (13m 32s · ↓ 23.4k tokens)
+  ⎿  ◼ parsePaneThinking + fixture
+     ◻ renderStatus 3-section rewrite
+     ◻ Pre/PostToolUse active marker hook
+     ◻ Test + coordinate launcher restart
+
+────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ctrl+t t…
+

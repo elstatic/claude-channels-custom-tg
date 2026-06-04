@@ -369,14 +369,16 @@ function consumeStatusMessage(): number | null {
   const f = `/tmp/claude-tg-status-${THREAD_ID}.json`
   try {
     const o = JSON.parse(readFileSync(f, 'utf8'))
-    if (o && o.consumed === false && typeof o.message_id === 'number') {
-      // Atomic write so the launcher animator / Stop hook never read a torn file.
+    if (o && o.consumed === false) {
+      // Atomic write so the launcher loop / Stop hook never read a torn file.
       const tmp = `${f}.tmp.${process.pid}`
       try { writeFileSync(tmp, JSON.stringify({ ...o, consumed: true })); renameSync(tmp, f) } catch {}
-      // Tell the dispatcher to stop the animator synchronously (kills the race
-      // where an in-flight animator edit clobbers the answer we're about to write).
+      // Stop the dispatcher's live working-log stream synchronously (also drops
+      // its ⏹ button), so the log freezes as a CLI transcript and the answer
+      // lands as its own separate message right below it.
       try { ipcClient?.send({ type: 'status_consume', thread_id: THREAD_ID }) } catch {}
-      return o.message_id
+      // Never morph the working log into the answer — always a fresh send.
+      return null
     }
   } catch {}
   return null
