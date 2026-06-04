@@ -3,6 +3,24 @@
 All notable changes to this project. SemVer pre-1.0: minor (0.x.0) for new
 features and breaking changes, patch (0.x.y) for bug fixes only.
 
+## 0.4.0 — 2026-06-04
+
+CLI-style live working log, now self-contained.
+
+- **In-topic live working log.** While Claude works, the dispatcher posts a
+  single message that grows in place (append-only, ~1.8s edits): finished tool
+  calls accumulate as `⏺` lines in order, with a live cursor (the running
+  tool's spinner, else the current `💭` thought lifted from the tmux pane). An
+  inline `⏹ Стоп` button rides on it and disappears when the turn ends; the
+  answer arrives as its own separate message below. A tap-to-copy
+  `debug topic id` header sits on top.
+- **Hooks shipped + auto-installed.** The hooks that power this
+  (`hooks/trace-tool.py` for the tool trace, `hooks/ensure-delivery.py` for the
+  Stop-time delivery guarantee) now live in the repo, and `install.sh` registers
+  them in `settings.json` (Stop / PreToolUse / PostToolUse) alongside the MCP.
+  A fresh `git clone` + `install.sh` now reproduces the full experience — no
+  manual hook setup. Adds `python3` to the prerequisite check.
+
 ## 0.2.1 — 2026-05-20
 
 - `schedule_job` gained a `one_shot` flag. When true, the job is deleted

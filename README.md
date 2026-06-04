@@ -28,6 +28,7 @@ systemctl --user enable --now telegram-launcher.service
 | tmux       | каждая claude-сессия живёт в собственной detached-tmux-панели        |
 | claude     | Claude Code CLI                                                      |
 | jq         | мерж конфигурации в существующий `~/projects/.claude/settings.json`  |
+| python3    | хуки живого лога работы (`hooks/trace-tool.py`, `ensure-delivery.py`) — только стандартная библиотека |
 | systemd user manager | диспетчер запускается как `telegram-launcher.service`      |
 
 **В BotFather** (опционально): `/mybots → твой бот → Bot Settings → Allow Topics in Private Chats`.

@@ -64,7 +64,7 @@ install_cmd_for() { # detect_pkgmgr-result, pkg-name
 }
 
 MISSING=()
-for cmd in bun tmux claude jq; do
+for cmd in bun tmux claude jq python3; do
   command -v "$cmd" >/dev/null 2>&1 || MISSING+=("$cmd")
 done
 
@@ -112,9 +112,10 @@ if (( ${#MISSING[@]} > 0 )); then
   fi
 fi
 
-ok "bun, tmux, claude, jq present"
+ok "bun, tmux, claude, jq, python3 present"
 BUN_BIN="$(command -v bun)"
 CLAUDE_BIN="$(command -v claude)"
+PYTHON_BIN="$(command -v python3)"
 
 # ─── 2. Bun dependencies ─────────────────────────────────────────────────
 say "Installing JS dependencies"
@@ -149,32 +150,44 @@ case ":$PATH:" in
   *) warn "$BIN_DIR is not in your PATH; add it to ~/.bashrc or equivalent" ;;
 esac
 
-# ─── 5. MCP registration in topic-root settings ──────────────────────────
-say "Registering MCP in $TOPIC_ROOT/.claude/settings.json"
+# ─── 5. MCP + hooks registration in topic-root settings ──────────────────
+say "Registering MCP + hooks in $TOPIC_ROOT/.claude/settings.json"
 mkdir -p "$TOPIC_ROOT/.claude"
 SETTINGS="$TOPIC_ROOT/.claude/settings.json"
 MCP_PATH="$REPO_DIR/telegram-ss"
+# Hooks that power the in-topic live working-log: trace-tool.py records each
+# tool call (Pre/PostToolUse) and ensure-delivery.py guarantees the final answer
+# reaches the chat (Stop). Referenced in place so `git pull` keeps them current.
+TRACE_HOOK="$PYTHON_BIN $REPO_DIR/hooks/trace-tool.py"
+DELIVERY_HOOK="$PYTHON_BIN $REPO_DIR/hooks/ensure-delivery.py"
 
 # Each per-topic dir created at spawn time symlinks its .claude to this
 # shared one, so MCP config + skills are configured once for all topics.
 
-# jq merge: read existing settings (or default {}), set mcpServers.telegram-ss.
+# jq merge: read existing settings (or default {}), set mcpServers.telegram-ss
+# and the three hook entries (overwriting only our keys).
 if [[ -f "$SETTINGS" ]]; then
   cur=$(cat "$SETTINGS")
 else
   cur='{}'
 fi
-new=$(echo "$cur" | jq --arg cwd "$MCP_PATH" --arg bun "$BUN_BIN" '
+new=$(echo "$cur" | jq \
+  --arg cwd "$MCP_PATH" --arg bun "$BUN_BIN" \
+  --arg trace "$TRACE_HOOK" --arg delivery "$DELIVERY_HOOK" '
   .mcpServers = (.mcpServers // {}) |
   .mcpServers["telegram-ss"] = {
     command: $bun,
     args: ["run", "--cwd", $cwd, "--shell=bun", "--silent", "start"]
-  }
+  } |
+  .hooks = (.hooks // {}) |
+  .hooks.Stop        = [{ hooks: [{ type: "command", command: $delivery }] }] |
+  .hooks.PreToolUse  = [{ matcher: "*", hooks: [{ type: "command", command: $trace }] }] |
+  .hooks.PostToolUse = [{ matcher: "*", hooks: [{ type: "command", command: $trace }] }]
 ')
 tmp=$(mktemp)
 echo "$new" > "$tmp"
 mv "$tmp" "$SETTINGS"
-ok "MCP registered"
+ok "MCP + hooks registered"
 
 # Pre-create the root-dm working dir (thread_id=0 case).
 mkdir -p "$TOPIC_ROOT/root"
