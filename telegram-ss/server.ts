@@ -23,6 +23,7 @@ import { homedir } from 'os'
 import { join, extname, sep } from 'path'
 import { connectToIpc } from '../telegram-launcher/ipc'
 import { JobStore, nextFireFrom } from '../telegram-launcher/jobs'
+import { mdToHtml, chunkMarkdown } from './render'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -79,10 +80,13 @@ function threadOpt<T extends object>(extra?: T): T & { message_thread_id?: numbe
 // with parse_mode. No-op when there's no topic (THREAD_ID 0).
 function withTopicTag(
   s: string,
-  parseMode?: 'MarkdownV2',
+  parseMode?: 'MarkdownV2' | 'HTML',
 ): { text: string; entities?: any[] } {
   if (!THREAD_ID) return { text: s }
   const id = String(THREAD_ID)
+  if (parseMode === 'HTML') {
+    return { text: `${s}\n\n🧵 <code>${id}</code>` }
+  }
   if (parseMode === 'MarkdownV2') {
     return { text: `${s}\n\n🧵 \`${id}\`` }
   }
@@ -444,8 +448,8 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           format: {
             type: 'string',
-            enum: ['text', 'markdownv2'],
-            description: "Rendering mode. 'markdownv2' enables Telegram formatting (bold, italic, code, links). Caller must escape special chars per MarkdownV2 rules. Default: 'text' (plain, no escaping needed).",
+            enum: ['html', 'text', 'markdownv2'],
+            description: "Rendering mode. DEFAULT 'html': write normal Markdown (code blocks ```lang, **bold**, *italic*, `code`, [links](url), # headers, - lists, > quotes) and the bridge renders it to Telegram — no escaping needed, just write Markdown. 'text' = raw plain (no rendering). 'markdownv2' = passthrough for callers that pre-escaped MarkdownV2.",
           },
         },
         required: ['chat_id', 'text'],
@@ -640,8 +644,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const text = args.text as string
         const reply_to = args.reply_to != null ? Number(args.reply_to) : undefined
         const files = (args.files as string[] | undefined) ?? []
-        const format = (args.format as string | undefined) ?? 'text'
-        const parseMode = format === 'markdownv2' ? 'MarkdownV2' as const : undefined
+        // Default renders the agent's markdown to Telegram HTML. 'text' = raw
+        // plain (no rendering); 'markdownv2' = passthrough for pre-escaped callers.
+        const format = (args.format as string | undefined) ?? 'html'
+        const renderHtml = format === 'html'
+        const parseMode: 'HTML' | 'MarkdownV2' | undefined = renderHtml
+          ? 'HTML' : format === 'markdownv2' ? 'MarkdownV2' : undefined
 
         assertAllowedChat(chat_id)
         // Reply lands → stop the "печатает…" indicator.
@@ -659,51 +667,64 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
         const mode = access.chunkMode ?? 'length'
         const replyMode = access.replyToMode ?? 'first'
-        const chunks = chunk(text, limit, mode)
         const sentIds: number[] = []
 
-        // If the dispatcher posted an in-topic "💬 работаю…" status message,
-        // morph it into the answer by editing it in place with the first chunk.
-        // Mark it consumed first so the launcher's animator stops touching it.
-        const statusMsgId = consumeStatusMessage()
+        // Stop the dispatcher's live working-log (also drops its ⏹ button). We
+        // never morph it — the answer is delivered as its own message below it.
+        consumeStatusMessage()
+
+        // Send one message, applying reply_parameters to the first one only
+        // (unless replyToMode = 'all'/'off').
+        const sendOne = async (
+          body: string,
+          entities: any[] | undefined,
+          pm: 'HTML' | 'MarkdownV2' | undefined,
+        ) => {
+          const useReplyTo =
+            reply_to != null && replyMode !== 'off' && (replyMode === 'all' || sentIds.length === 0)
+          const sent = await bot.api.sendMessage(chat_id, body, {
+            ...(useReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
+            ...(pm ? { parse_mode: pm } : {}),
+            ...(entities ? { entities } : {}),
+          } as any, AbortSignal.timeout(SEND_TIMEOUT_MS))
+          sentIds.push(sent.message_id)
+        }
 
         try {
-          for (let i = 0; i < chunks.length; i++) {
-            const shouldReplyTo =
-              reply_to != null &&
-              replyMode !== 'off' &&
-              (replyMode === 'all' || i === 0)
-            // Tap-to-copy topic-id footer on the LAST chunk only (one per answer).
-            const tagged = i === chunks.length - 1
-              ? withTopicTag(chunks[i], parseMode)
-              : { text: chunks[i] as string, entities: undefined as any[] | undefined }
-            if (i === 0 && statusMsgId != null) {
+          if (renderHtml) {
+            // Chunk the RAW markdown (fence-aware), then render each chunk to HTML
+            // independently so tags never span messages. Headroom under the limit
+            // leaves room for the added tags + footer.
+            const rawChunks = chunkMarkdown(text, Math.min(limit, 3500))
+            for (let i = 0; i < rawChunks.length; i++) {
+              const isLast = i === rawChunks.length - 1
+              const html = mdToHtml(rawChunks[i])
+              const tagged = isLast ? withTopicTag(html, 'HTML') : { text: html }
               try {
-                await bot.api.editMessageText(chat_id, statusMsgId, tagged.text, {
-                  ...(parseMode ? { parse_mode: parseMode } : {}),
-                  ...(tagged.entities ? { entities: tagged.entities } : {}),
-                  // Drop the ⏹ Стоп button — the bubble is now the final answer.
-                  reply_markup: { inline_keyboard: [] },
-                } as any)
-                sentIds.push(statusMsgId)
-                continue
+                await sendOne(tagged.text, undefined, 'HTML')
               } catch {
-                // Status message gone/uneditable — fall through to a normal send
-                // so the reply still lands.
+                // HTML rejected (bad tag) or too long → hard-split the RAW chunk
+                // and send as plain text, so a render bug never drops a message.
+                const parts = chunk(rawChunks[i], limit, 'length')
+                for (let j = 0; j < parts.length; j++) {
+                  const tail = isLast && j === parts.length - 1
+                  const t = tail ? withTopicTag(parts[j], undefined) : { text: parts[j], entities: undefined as any[] | undefined }
+                  await sendOne(t.text, t.entities, undefined)
+                }
               }
             }
-            const sent = await bot.api.sendMessage(chat_id, tagged.text, {
-              ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
-              ...(parseMode ? { parse_mode: parseMode } : {}),
-              ...(tagged.entities ? { entities: tagged.entities } : {}),
-            } as any, AbortSignal.timeout(SEND_TIMEOUT_MS))
-            sentIds.push(sent.message_id)
+          } else {
+            const chunks = chunk(text, limit, mode)
+            for (let i = 0; i < chunks.length; i++) {
+              const tagged = i === chunks.length - 1
+                ? withTopicTag(chunks[i], parseMode)
+                : { text: chunks[i] as string, entities: undefined as any[] | undefined }
+              await sendOne(tagged.text, tagged.entities, parseMode)
+            }
           }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err)
-          throw new Error(
-            `reply failed after ${sentIds.length} of ${chunks.length} chunk(s) sent: ${msg}`,
-          )
+          throw new Error(`reply failed after ${sentIds.length} message(s) sent: ${msg}`)
         }
 
         // Files go as separate messages (Telegram doesn't mix text+file in one
