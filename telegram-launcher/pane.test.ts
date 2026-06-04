@@ -63,6 +63,45 @@ test('explicit thinking text above an active spinner is captured', () => {
   expect(r.lines.join('\n')).not.toContain('❯')
 })
 
+test('regression: `*` spinner glyph is detected by shape, not a glyph list', () => {
+  const sample = [
+    '  Я обновляю парсер, чтобы он ловил спиннер по форме.',
+    '',
+    '* Creating… (3m 3s · ↓ 7.7k tokens)',
+    '  ⎿ Tip: Name your conversations with /rename',
+    '',
+    '────────────────────────────',
+    '❯ ',
+    '────────────────────────────',
+  ].join('\n')
+  const r = parsePaneThinking(sample)
+  expect(r.statusWord).toBe('Creating')
+  expect(r.lines.some(l => l.includes('ловил спиннер'))).toBe(true)
+})
+
+test('regression: queued inbound message must NOT be shown as thinking', () => {
+  // The truncated "чтобы пр…" bug: the user's own queued message leaked in.
+  const sample = [
+    '  Реальная мысль агента вот здесь.',
+    '',
+    '* Creating… (1m · ↓ 2k tokens)',
+    '  ⎿ Tip: ...',
+    '',
+    '',
+    '  ← telegram-ss · el_static: чтобы приблизить функционал десктопа',
+    '────────────────────────────',
+    '❯ ',
+    '────────────────────────────',
+    '  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt',
+  ].join('\n')
+  const r = parsePaneThinking(sample)
+  const blob = r.lines.join('\n')
+  expect(blob).not.toContain('telegram-ss')
+  expect(blob).not.toContain('чтобы приблизить')
+  expect(blob).not.toContain('el_static')
+  expect(r.lines.some(l => l.includes('Реальная мысль'))).toBe(true)
+})
+
 test('garbage / empty input is safe', () => {
   expect(parsePaneThinking('')).toEqual({ statusWord: '', lines: [] })
   expect(parsePaneThinking('\n\n   \n')).toEqual({ statusWord: '', lines: [] })
