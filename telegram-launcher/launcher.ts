@@ -2209,23 +2209,25 @@ void (async () => {
           // Tell the owner the bridge is back (boot or recovery from an outage).
           notifyOwner(wasDown ? `✅ Бридж восстановился, поллинг возобновлён (@${info.username}).` : `✅ Диспетчер запущен, поллинг активен (@${info.username}).`)
           void bot.api.setMyCommands([
-            { command: 'start', description: 'Welcome and setup guide' },
-            { command: 'help', description: 'What this bot can do' },
-            { command: 'status', description: 'Check your pairing state' },
-            { command: 'login', description: 'Re-authenticate the Claude account' },
-            { command: 'health', description: 'Dispatcher health' },
-            { command: 'effort', description: 'Set thinking effort' },
-            { command: 'model', description: 'Pick model' },
-            { command: 'mode', description: 'Cycle permission mode' },
-            { command: 'clear', description: 'Clear context' },
-            { command: 'resume', description: 'Resume conversation' },
-            { command: 'interrupt', description: 'Interrupt (Esc)' },
-            { command: 'jobs', description: 'List scheduled tasks' },
-            { command: 'cancel', description: 'Cancel a scheduled task: /cancel <id>' },
-            { command: 'search', description: 'Search history: /search <text>' },
-            { command: 'cost', description: 'Token usage of this session' },
-            { command: 'stop', description: 'Kill Claude session in this topic' },
+            { command: 'interrupt', description: '✋ Прервать текущий ход (Esc)' },
+            { command: 'stop', description: '⏹ Остановить сессию в топике' },
+            { command: 'model', description: '🧠 Выбрать модель' },
+            { command: 'effort', description: '⚙️ Уровень мышления' },
+            { command: 'mode', description: '🔁 Режим прав' },
+            { command: 'clear', description: '🧹 Очистить контекст' },
+            { command: 'resume', description: '↻ Возобновить разговор' },
+            { command: 'login', description: '🔑 Перелогиниться в аккаунт Claude' },
+            { command: 'cost', description: '💰 Токены этой сессии' },
+            { command: 'jobs', description: '🗓 Запланированные задачи' },
+            { command: 'cancel', description: 'Отменить задачу: /cancel <id>' },
+            { command: 'search', description: 'Поиск по истории: /search <текст>' },
+            { command: 'status', description: 'Статус пары' },
+            { command: 'health', description: 'Здоровье диспетчера' },
+            { command: 'help', description: 'Что умеет бот' },
+            { command: 'start', description: 'Приветствие и настройка' },
           ], { scope: { type: 'all_private_chats' } }).catch(() => {})
+          // Make the ☰ button (left of the input) open the command list.
+          void bot.api.setChatMenuButton({ menu_button: { type: 'commands' } } as any).catch(() => {})
         },
       })
       return
