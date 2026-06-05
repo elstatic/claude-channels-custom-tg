@@ -903,10 +903,10 @@ const STATUS_DOTS = ['.', '..', '...', '....', '.....']
 const STATUS_MAX_MS = 10 * 60_000
 // Edit cadence for the growing working-log message. ~1.8s reads as calm/CLI-like
 // and stays near Telegram's edit ceiling; 429s back off via retry_after below.
-const STATUS_TICK_MS = 1800
+const STATUS_TICK_MS = 1200
 // Braille spinner for the live cursor line (one frame per tick).
 const SPIN_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
-type StatusEntry = { messageId: number; chatId: number; timer: ReturnType<typeof setInterval>; dot: number; startedAt: number; skipUntil?: number }
+type StatusEntry = { messageId: number; chatId: number; timer: ReturnType<typeof setInterval>; dot: number; startedAt: number; skipUntil?: number; draftId?: number }
 const statusMessages = new Map<number, StatusEntry>()
 
 function statusFile(threadId: number): string {
@@ -1183,34 +1183,54 @@ function statusConsumed(threadId: number): boolean | null {
   } catch { return null }
 }
 
+// Live streaming body for the ephemeral DRAFT: the visible action log (what
+// it's doing — bash/skills/subagents/tools) as a stable header, then the answer
+// typing out below. Telegram animates only the changed tail, so the header sits
+// still while the answer streams — desktop/terminal-like. Plain text; min 1 char
+// (Telegram requires non-empty), capped under 4096.
+function renderDraft(threadId: number): string {
+  let trace = ''
+  try { trace = readFileSync(traceFile(threadId), 'utf8').trim() } catch {}
+  const tools = trace ? trace.split('\n').filter(Boolean).map(d => `⏺ ${d.replace(/^•\s*/, '')}`) : []
+  let active = ''
+  try { active = readFileSync(activeFile(threadId), 'utf8').trim() } catch {}
+
+  const head: string[] = tools.slice(-12)
+  if (active) head.push(`⏺ ${active} …`)
+
+  let answer = readLatestDraft(threadId)
+  if (answer.length > STATUS_DRAFT_CAP) answer = '…' + answer.slice(answer.length - STATUS_DRAFT_CAP)
+
+  const parts: string[] = []
+  if (head.length) parts.push(head.join('\n'))
+  if (answer) { if (head.length) parts.push('┄┄┄┄┄┄┄┄'); parts.push(answer) }
+  let body = parts.join('\n').trim()
+  if (!body) body = '⏳'
+  return body.length > STATUS_MSG_CAP ? body.slice(0, STATUS_MSG_CAP) : body
+}
+
+// Push one draft frame. Same draft_id → Telegram animates the diff smoothly.
+function pushDraft(threadId: number, chatId: number, draftId: number): Promise<unknown> {
+  return bot.api.sendMessageDraft(chatId, draftId, renderDraft(threadId), {
+    message_thread_id: threadId || undefined,
+  } as any)
+}
+
 async function startStatusMessage(threadId: number, chatId: number): Promise<void> {
   if (!threadId) return
-  // Reuse an existing, still-active working message (rapid-fire inbound) instead
-  // of posting a second log into the same topic.
+  // Reuse an existing, still-active draft loop (rapid-fire inbound).
   if (statusMessages.has(threadId) && statusConsumed(threadId) === false) return
   stopStatusMessage(threadId)
   // Fresh turn → fresh trace + no stale running-tool marker + reset error dedup.
   relayedTurnError.delete(threadId)
   atomicWrite(traceFile(threadId), '')
   try { rmSync(activeFile(threadId), { force: true }) } catch {}
-  // Post the working-log message with the inline ⏹ button, then grow it in place.
-  let messageId: number
-  try {
-    const sent = await bot.api.sendMessage(chatId, renderStatus(threadId, 0), {
-      message_thread_id: threadId || undefined,
-      parse_mode: 'HTML',
-      reply_markup: statusKeyboard(threadId),
-    } as any)
-    messageId = sent.message_id
-  } catch { return }
-  // Deliberately NO message_id in the status file: that keeps reply()/ensure
-  // -delivery from "morphing" this working log into the answer (any server.ts
-  // version) — the answer must be a separate message. The launcher edits the log
-  // via the in-memory entry below; `consumed` gates the loop + the Stop hook.
   atomicWrite(statusFile(threadId), JSON.stringify({
     chat_id: chatId, thread_id: threadId, consumed: false,
   }))
-  const entry: StatusEntry = { messageId, chatId, dot: 0, startedAt: Date.now(), timer: undefined as any }
+  const draftId = threadId // stable, non-zero per topic
+  const entry: StatusEntry = { messageId: 0, chatId, draftId, dot: 0, startedAt: Date.now(), timer: undefined as any }
+  void pushDraft(threadId, chatId, draftId).catch(() => {}) // first frame now
   entry.timer = setInterval(() => {
     // Self-stop once server.ts/the Stop hook took over (consumed) or after the cap.
     if (statusConsumed(threadId) !== false || Date.now() - entry.startedAt > STATUS_MAX_MS) {
@@ -1219,21 +1239,15 @@ async function startStatusMessage(threadId: number, chatId: number): Promise<voi
       if (capped) { try { atomicWrite(statusFile(threadId), JSON.stringify({ chat_id: chatId, thread_id: threadId, consumed: true })) } catch {} }
       return
     }
-    // Fatal Claude Code error (auth/credit/rate-limit/API) with no reply →
-    // relay it to the topic once, then freeze the working log so it doesn't
-    // spin forever on a dead turn.
+    // Fatal Claude Code error with no reply → relay once, then stop the stream.
     if (maybeRelaySessionError(threadId, chatId)) {
       stopStatusMessage(threadId)
       try { atomicWrite(statusFile(threadId), JSON.stringify({ chat_id: chatId, thread_id: threadId, consumed: true })) } catch {}
       return
     }
-    // Honour a 429 back-off window before spending another edit.
     if (entry.skipUntil && Date.now() < entry.skipUntil) return
-    entry.dot = (entry.dot + 1) % 600 // free-running tick (spinner)
-    void bot.api.editMessageText(chatId, messageId, renderStatus(threadId, entry.dot), {
-      parse_mode: 'HTML',
-      reply_markup: statusKeyboard(threadId),
-    } as any).catch((e: any) => {
+    entry.dot++
+    void pushDraft(threadId, chatId, draftId).catch((e: any) => {
       const ra = e?.parameters?.retry_after ?? (e instanceof GrammyError ? e.parameters?.retry_after : undefined)
       if (ra) entry.skipUntil = Date.now() + (ra * 1000) + 250
     })
@@ -1246,18 +1260,14 @@ function stopStatusMessage(threadId: number): void {
   if (!e) return
   clearInterval(e.timer)
   statusMessages.delete(threadId)
-  // Turn finished → collapse the working log to its CLI-style action transcript
-  // (drop the streamed draft so it doesn't duplicate the separate answer) and
-  // strip the ⏹ button. Fall back to just removing the button if the edit fails.
-  if (e.messageId) {
-    void bot.api.editMessageText(e.chatId, e.messageId, renderStatus(threadId, e.dot, true), {
-      parse_mode: 'HTML',
-      reply_markup: { inline_keyboard: [] },
-    } as any).catch(() => {
-      void bot.api.editMessageReplyMarkup(e.chatId, e.messageId, {
-        reply_markup: { inline_keyboard: [] },
-      } as any).catch(() => {})
-    })
+  // Turn finished → clear the ephemeral draft (empty text) so it doesn't linger.
+  // The answer arrives as its own real message via reply(); the draft was only
+  // the live preview.
+  const draftId = e.draftId ?? threadId
+  if (draftId) {
+    void bot.api.sendMessageDraft(e.chatId, draftId, '', {
+      message_thread_id: threadId || undefined,
+    } as any).catch(() => {})
   }
 }
 
