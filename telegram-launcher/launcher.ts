@@ -1053,36 +1053,126 @@ function readLatestNarration(threadId: number): string {
   } catch { return '' }
 }
 
+// The FULL current-turn assistant prose for the live streaming draft: every
+// `text` block since the last real user message, joined in order (falls back to
+// the latest `thinking` block when no visible text yet). Untruncated — the
+// caller budgets it. Clean source (no TUI chrome/wrapping), unlike pane scraping.
+function readLatestDraft(threadId: number): string {
+  try {
+    const projRoot = join(homedir(), '.claude', 'projects')
+    const dirs = readdirSync(projRoot).filter(d => d.endsWith(`-topic-${threadId}`))
+    let best: { path: string; mtime: number } | null = null
+    for (const d of dirs) {
+      try {
+        for (const f of readdirSync(join(projRoot, d))) {
+          if (!f.endsWith('.jsonl')) continue
+          const p = join(projRoot, d, f)
+          const st = statSync(p)
+          if (!best || st.mtimeMs > best.mtime) best = { path: p, mtime: st.mtimeMs }
+        }
+      } catch {}
+    }
+    if (!best) return ''
+    const fd = openSync(best.path, 'r')
+    let tail = ''
+    try {
+      const size = fstatSync(fd).size
+      const len = Math.min(size, 262144) // 256KB tail covers a long turn
+      const buf = Buffer.allocUnsafe(len)
+      readSync(fd, buf, 0, len, size - len)
+      tail = buf.toString('utf8')
+    } finally { closeSync(fd) }
+    const objs: any[] = []
+    for (const ln of tail.split('\n')) { try { objs.push(JSON.parse(ln)) } catch {} }
+    // Start just after the last real user message so we don't bleed prior turns.
+    let startIdx = 0
+    for (let i = objs.length - 1; i >= 0; i--) { if (isRealUserMsg(objs[i])) { startIdx = i + 1; break } }
+    const texts: string[] = []
+    let lastThinking = ''
+    for (let i = startIdx; i < objs.length; i++) {
+      const o = objs[i]
+      if (o?.type !== 'assistant') continue
+      for (const b of o?.message?.content ?? []) {
+        if (b?.type === 'text' && (b.text || '').trim()) texts.push(b.text)
+        else if (b?.type === 'thinking' && (b.thinking || '').trim()) lastThinking = b.thinking
+      }
+    }
+    return (texts.join('\n\n').trim() || lastThinking.trim())
+  } catch { return '' }
+}
+
+// Keep the whole working-log message comfortably under Telegram's 4096 cap.
+const STATUS_MSG_CAP = 3900
+const STATUS_DRAFT_CAP = 3400
+
 // CLI/desktop-style working log rendered into ONE message that GROWS in place
 // (edited, append-only): finished tool calls accumulate as ⏺ lines and are never
 // overwritten. The last line is a single live cursor — the running tool (⏺ …
 // spinner) wins; between tools it's the current thought (💭 spinner). HTML so the
 // debug id is tap-to-copy; dynamic text is escaped. `tick` drives the spinner.
-function renderStatus(threadId: number, tick: number): string {
+function renderStatus(threadId: number, tick: number, frozen = false): string {
   const spin = SPIN_FRAMES[tick % SPIN_FRAMES.length]
-  const lines: string[] = [`debug topic id: <code>${threadId}</code>`]
+  const header = `debug topic id: <code>${threadId}</code>`
 
-  // Append-only log of finished tool calls (trace is written in order by the
-  // PostToolUse hook). Cap the tail to keep the message under Telegram's 4096.
+  // Finished tool calls (append-only, written in order by the PostToolUse hook).
   let trace = ''
   try { trace = readFileSync(traceFile(threadId), 'utf8').trim() } catch {}
-  const done = trace ? trace.split('\n').filter(Boolean).slice(-14) : []
-  for (const d of done) lines.push(htmlEscape(d.replace(/^•\s/, '⏺ ')))
+  const toolLines = (trace ? trace.split('\n').filter(Boolean) : [])
+    .map(d => `⏺ ${htmlEscape(d.replace(/^•\s*/, ''))}`)
 
-  // Single live trailing line: the currently-running tool, else the thought.
+  // Frozen (turn finished): collapse to the CLI-style action transcript only —
+  // the answer arrives as its own separate message, so don't duplicate it here.
+  if (frozen) {
+    const tail = toolLines.slice(-20)
+    return tail.length ? [header, ...tail].join('\n') : `${header}\n✅ ответ ниже ⤵️`
+  }
+
+  // Currently-running tool (PreToolUse hook), if any.
   let active = ''
   try { active = readFileSync(activeFile(threadId), 'utf8').trim() } catch {}
-  if (active) {
-    lines.push(`⏺ ${htmlEscape(active)} ${spin}`)
-  } else {
-    const pane = tmuxThinking(threadId)
-    let thought = pane.lines.length ? pane.lines[pane.lines.length - 1] : ''
-    if (!thought) thought = readLatestNarration(threadId) // transcript fallback
-    // "Crunched for …" is CC's idle caption, not a live action — skip it.
-    if (!thought && pane.statusWord && !/^Crunch/i.test(pane.statusWord)) thought = pane.statusWord
-    lines.push(`💭 ${spin}${thought ? ' ' + htmlEscape(thought) : ''}`)
+
+  // The live answer DRAFT — the full prose the model is composing this turn,
+  // grown in place each tick so the user reads it like a terminal/desktop app
+  // instead of a single truncated line. Transcript is the clean primary source;
+  // the pane is a liveness fallback when nothing's flushed yet.
+  let draft = ''
+  if (!active) {
+    draft = readLatestDraft(threadId)
+    if (!draft) {
+      const pane = tmuxThinking(threadId)
+      draft = pane.lines.length ? pane.lines[pane.lines.length - 1] : ''
+      if (!draft && pane.statusWord && !/^Crunch/i.test(pane.statusWord)) draft = pane.statusWord
+    }
   }
-  return lines.join('\n')
+
+  // Budget: header + draft (capped, keep the tail = the latest writing) first,
+  // then as many recent tool lines as still fit under Telegram's 4096 cap.
+  let draftBlock = ''
+  if (draft) {
+    let d = draft
+    if (d.length > STATUS_DRAFT_CAP) d = '…' + d.slice(d.length - STATUS_DRAFT_CAP)
+    draftBlock = htmlEscape(d)
+  }
+  const out: string[] = [header]
+  const toolBudget = Math.max(0, STATUS_MSG_CAP - header.length - draftBlock.length - 8)
+  const shownTools: string[] = []
+  let tlen = 0
+  for (let i = toolLines.length - 1; i >= 0; i--) {
+    if (tlen + toolLines[i].length + 1 > toolBudget) break
+    shownTools.unshift(toolLines[i]); tlen += toolLines[i].length + 1
+  }
+  out.push(...shownTools)
+
+  if (active) {
+    out.push(`⏺ ${htmlEscape(active)} ${spin}`)
+  } else if (draftBlock) {
+    if (shownTools.length) out.push('')  // blank line separates tools from prose
+    out.push(draftBlock)
+    out.push(`💭 ${spin}`)               // live cursor under the growing draft
+  } else {
+    out.push(`💭 ${spin}`)
+  }
+  return out.join('\n')
 }
 
 // null = no file; true/false = consumed flag.
@@ -1156,12 +1246,18 @@ function stopStatusMessage(threadId: number): void {
   if (!e) return
   clearInterval(e.timer)
   statusMessages.delete(threadId)
-  // Turn finished → strip the ⏹ button from the working log (it stays as a plain
-  // CLI-style transcript; the answer arrives as its own separate message).
+  // Turn finished → collapse the working log to its CLI-style action transcript
+  // (drop the streamed draft so it doesn't duplicate the separate answer) and
+  // strip the ⏹ button. Fall back to just removing the button if the edit fails.
   if (e.messageId) {
-    void bot.api.editMessageReplyMarkup(e.chatId, e.messageId, {
+    void bot.api.editMessageText(e.chatId, e.messageId, renderStatus(threadId, e.dot, true), {
+      parse_mode: 'HTML',
       reply_markup: { inline_keyboard: [] },
-    } as any).catch(() => {})
+    } as any).catch(() => {
+      void bot.api.editMessageReplyMarkup(e.chatId, e.messageId, {
+        reply_markup: { inline_keyboard: [] },
+      } as any).catch(() => {})
+    })
   }
 }
 
