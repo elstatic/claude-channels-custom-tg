@@ -49,6 +49,64 @@ function isProse(line: string): boolean {
   return true
 }
 
+// Fatal/user-facing errors Claude Code surfaces in the pane as a "●"-prefixed
+// line (e.g. "● Please run /login · API Error: 401 Invalid authentication
+// credentials"). When a turn dies on one of these, no reply() is ever sent and
+// the user just sees the spinner forever — so the dispatcher relays it to chat.
+// Conservative signature list: only unambiguous failures, never normal prose
+// that happens to contain the word "error".
+const ERROR_SIGNATURES = [
+  /API Error/i,
+  /Please run \/login/i,
+  /Invalid authentication/i,
+  /Failed to authenticate/i,
+  /Credit balance is too low/i,
+  /\boverloaded(_error)?\b/i,
+  /rate[ _]?limit/i,
+  /quota/i,
+  /\b(401|403|429|500|503|529)\b.*\berror\b/i,
+  /\berror\b.*\b(401|403|429|500|503|529)\b/i,
+  /Internal server error/i,
+]
+
+/** Strip CC's leading marker glyph + collapse whitespace for a chat-friendly line. */
+function cleanErrorLine(line: string): string {
+  return line
+    .replace(/^\s*[●○⏺✻✶✗✘⚠×]\s*/, '') // drop the leading status/error glyph
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+// Return the most recent error line in the pane (searching bottom-up, but above
+// the input box / spinner chrome), or null. Pure + testable.
+export function parsePaneError(text: string): string | null {
+  const raw = text.replace(/\r/g, '').split('\n').map(l => l.replace(/\s+$/, ''))
+  // Same region anchoring as parsePaneThinking: the conversation is above the
+  // spinner (just over the input box); with no spinner this frame, above the
+  // first box border. That keeps what the user is typing in the input box out.
+  let spin = -1
+  for (let i = raw.length - 1; i >= 0; i--) {
+    if (isSpinnerLine(raw[i].trim())) { spin = i; break }
+  }
+  let end = spin
+  if (end < 0) {
+    end = raw.findIndex(l => BORDER_RE.test(l.trim()))
+    if (end < 0) end = raw.length
+  }
+  for (let i = end - 1; i >= 0; i--) {
+    const t = raw[i].trim()
+    if (!t) continue
+    if (/^[←→]/.test(t)) continue                 // queued/echoed inbound markers
+    if (/(^|\s)telegram-ss\s*·/.test(t)) continue // our own channel echo
+    if (ERROR_SIGNATURES.some(re => re.test(t))) {
+      const msg = cleanErrorLine(t)
+      if (msg.length > 400) return msg.slice(0, 399) + '…'
+      return msg
+    }
+  }
+  return null
+}
+
 export function parsePaneThinking(text: string, maxLines = 3): PaneThinking {
   const raw = text.replace(/\r/g, '').split('\n').map(l => l.replace(/\s+$/, ''))
 

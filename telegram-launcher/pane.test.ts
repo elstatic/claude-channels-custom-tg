@@ -1,7 +1,7 @@
 import { test, expect } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { parsePaneThinking } from './pane'
+import { parsePaneThinking, parsePaneError } from './pane'
 
 const fixture = (n: string) => readFileSync(join(import.meta.dir, 'testdata', n), 'utf8')
 
@@ -105,4 +105,38 @@ test('regression: queued inbound message must NOT be shown as thinking', () => {
 test('garbage / empty input is safe', () => {
   expect(parsePaneThinking('')).toEqual({ statusWord: '', lines: [] })
   expect(parsePaneThinking('\n\n   \n')).toEqual({ statusWord: '', lines: [] })
+})
+
+test('parsePaneError: auth 401 line is detected and cleaned', () => {
+  const sample = [
+    '  Some earlier narration.',
+    '',
+    '● Please run /login · API Error: 401 Invalid authentication credentials',
+    '✻ Churned for 2s',
+    '────────────────────────────',
+    '❯ ',
+    '────────────────────────────',
+    '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+  ].join('\n')
+  const err = parsePaneError(sample)
+  expect(err).toBe('Please run /login · API Error: 401 Invalid authentication credentials')
+})
+
+test('parsePaneError: rate-limit / credit errors detected', () => {
+  expect(parsePaneError('● API Error: 429 rate_limit_error')).toMatch(/429|rate/i)
+  expect(parsePaneError('● Credit balance is too low')).toMatch(/Credit balance/i)
+})
+
+test('parsePaneError: normal prose and our own echo are NOT errors', () => {
+  expect(parsePaneError('  I fixed the error in the parser and moved on.')).toBeNull()
+  expect(parsePaneError('  ← telegram-ss · el_static: got a 401 earlier?')).toBeNull()
+  expect(parsePaneError('')).toBeNull()
+  // An error line that lives below the input border (footer/help) is ignored.
+  const belowBorder = [
+    '  Real narration up here.',
+    '────────────────────────────',
+    '❯ API Error: do not match what the user is typing',
+    '────────────────────────────',
+  ].join('\n')
+  expect(parsePaneError(belowBorder)).toBeNull()
 })

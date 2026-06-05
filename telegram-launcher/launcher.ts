@@ -22,7 +22,7 @@
 import { Bot, GrammyError, InlineKeyboard, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { spawn, spawnSync } from 'child_process'
-import { parsePaneThinking } from './pane'
+import { parsePaneThinking, parsePaneError } from './pane'
 import {
   readFileSync, writeFileSync, mkdirSync, chmodSync, renameSync, readdirSync, rmSync, statSync,
   openSync, readSync, fstatSync, closeSync,
@@ -937,6 +937,35 @@ function tmuxThinking(threadId: number): { statusWord: string; lines: string[] }
   } catch { return { statusWord: '', lines: [] } }
 }
 
+// Raw pane dump (used for error detection). Cheap; returns '' on failure.
+function tmuxCaptureRaw(threadId: number): string {
+  try {
+    const r = spawnSync('tmux', ['capture-pane', '-p', '-t', `claude_t${threadId}:0.0`],
+      { encoding: 'utf8', timeout: 1500, maxBuffer: 1 << 20 })
+    return r.status === 0 && r.stdout ? r.stdout : ''
+  } catch { return '' }
+}
+
+// Per-thread guard so a single fatal error is relayed to chat once per turn,
+// not on every 1.8s animator tick. Cleared when a fresh turn starts.
+const relayedTurnError = new Map<number, string>()
+
+// A turn died on a Claude Code error (auth/credit/rate-limit/API) with no
+// reply() — relay it to the topic as its own message (so the user's device
+// pings) and freeze the working log. Returns true if a fatal error was handled.
+function maybeRelaySessionError(threadId: number, chatId: number): boolean {
+  const err = parsePaneError(tmuxCaptureRaw(threadId))
+  if (!err) return false
+  if (relayedTurnError.get(threadId) === err) return true // already sent this turn
+  relayedTurnError.set(threadId, err)
+  const isAuth = /login|authenticat|401/i.test(err)
+  const body = isAuth
+    ? `⚠️ Сессия не авторизована:\n${err}\n\nНужен ре-логин — отправь /login в этот топик.`
+    : `⚠️ Ошибка сессии:\n${err}`
+  void bot.api.sendMessage(chatId, body, { message_thread_id: threadId || undefined } as any).catch(() => {})
+  return true
+}
+
 // Atomic write so the launcher / server.ts / hooks never read a torn file.
 function atomicWrite(path: string, data: string): void {
   const tmp = `${path}.tmp.${process.pid}.${Date.now()}`
@@ -954,6 +983,7 @@ function cleanupCoordFiles(threadId: number): void {
   try { rmSync(statusFile(threadId), { force: true }) } catch {}
   try { rmSync(traceFile(threadId), { force: true }) } catch {}
   try { rmSync(activeFile(threadId), { force: true }) } catch {}
+  relayedTurnError.delete(threadId)
 }
 
 function htmlEscape(s: string): string {
@@ -1069,7 +1099,8 @@ async function startStatusMessage(threadId: number, chatId: number): Promise<voi
   // of posting a second log into the same topic.
   if (statusMessages.has(threadId) && statusConsumed(threadId) === false) return
   stopStatusMessage(threadId)
-  // Fresh turn → fresh trace + no stale running-tool marker.
+  // Fresh turn → fresh trace + no stale running-tool marker + reset error dedup.
+  relayedTurnError.delete(threadId)
   atomicWrite(traceFile(threadId), '')
   try { rmSync(activeFile(threadId), { force: true }) } catch {}
   // Post the working-log message with the inline ⏹ button, then grow it in place.
@@ -1096,6 +1127,14 @@ async function startStatusMessage(threadId: number, chatId: number): Promise<voi
       const capped = Date.now() - entry.startedAt > STATUS_MAX_MS
       stopStatusMessage(threadId)
       if (capped) { try { atomicWrite(statusFile(threadId), JSON.stringify({ chat_id: chatId, thread_id: threadId, consumed: true })) } catch {} }
+      return
+    }
+    // Fatal Claude Code error (auth/credit/rate-limit/API) with no reply →
+    // relay it to the topic once, then freeze the working log so it doesn't
+    // spin forever on a dead turn.
+    if (maybeRelaySessionError(threadId, chatId)) {
+      stopStatusMessage(threadId)
+      try { atomicWrite(statusFile(threadId), JSON.stringify({ chat_id: chatId, thread_id: threadId, consumed: true })) } catch {}
       return
     }
     // Honour a 429 back-off window before spending another edit.
