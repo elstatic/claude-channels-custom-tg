@@ -3,6 +3,31 @@
 All notable changes to this project. SemVer pre-1.0: minor (0.x.0) for new
 features and breaking changes, patch (0.x.y) for bug fixes only.
 
+## 0.5.0 — 2026-06-05
+
+Native streaming, Telegram login, and error visibility.
+
+- **Live streaming via native message drafts.** Replaced the ~1.8s
+  `sendMessage`+`editMessageText` working-log loop with `sendMessageDraft`
+  (stable per-topic `draft_id`): Telegram animates the diff, so the action-log
+  header stays put while the answer types out below it — smooth, desktop-like.
+  The draft is cleared on turn end; the answer still lands as its own real
+  message via `reply()`. No unread-badge spam (the reason drafts were dropped in
+  0.1.x) — verified on current clients. Tick 1.8s → 1.2s. Drafts can't carry
+  inline buttons, so the working-log ⏹ is gone — interrupt via `/interrupt` or `/stop`.
+- **`/login` over Telegram.** New `login-pty.py` drives `claude auth login` in a
+  wide pty over a small line protocol; `/login` relays the OAuth authorize URL
+  into the topic, captures the pasted code, and confirms success by
+  `credentials.json` `expiresAt` advancing — re-authenticate without terminal access.
+- **Session errors relayed to the chat.** Fatal Claude Code errors (auth /
+  credit / rate-limit / API) that used to leave the user on a dead spinner are
+  detected from the pane (`parsePaneError`, conservative signatures, unit-tested),
+  posted into the topic, and freeze the stream. Auth errors point at `/login`.
+- **Native ☰ command menu.** `setChatMenuButton({type:'commands'})` + a
+  reordered, Russian command list (session controls first).
+- **Reverted the default Markdown→HTML answer rendering** (0.4.x regression that
+  truncated/garbled long answers). Answers send as plain text again.
+
 ## 0.4.0 — 2026-06-04
 
 CLI-style live working log, now self-contained.
