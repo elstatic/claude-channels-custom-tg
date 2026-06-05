@@ -1191,12 +1191,12 @@ function statusConsumed(threadId: number): boolean | null {
 function renderDraft(threadId: number): string {
   let trace = ''
   try { trace = readFileSync(traceFile(threadId), 'utf8').trim() } catch {}
-  const tools = trace ? trace.split('\n').filter(Boolean).map(d => `⏺ ${d.replace(/^•\s*/, '')}`) : []
+  const tools = trace ? trace.split('\n').filter(Boolean).map(d => `• ${d.replace(/^•\s*/, '')}`) : []
   let active = ''
   try { active = readFileSync(activeFile(threadId), 'utf8').trim() } catch {}
 
   const head: string[] = tools.slice(-12)
-  if (active) head.push(`⏺ ${active} …`)
+  if (active) head.push(`• ${active} …`)
 
   let answer = readLatestDraft(threadId)
   if (answer.length > STATUS_DRAFT_CAP) answer = '…' + answer.slice(answer.length - STATUS_DRAFT_CAP)
