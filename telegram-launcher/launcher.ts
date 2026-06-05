@@ -1248,6 +1248,129 @@ function sessionMenu(): InlineKeyboard {
 }
 
 // ── Commands ──────────────────────────────────────────────────────────────
+// ── Login over Telegram (claude auth login OAuth code-flow) ────────────────
+// login-pty.py drives `claude auth login` in a pty; we relay its authorize URL
+// to the topic, feed back the pasted code, and judge success by credentials
+// expiresAt growing (robust, no text-scraping). Auth is account-global → only
+// one flow at a time.
+const CLAUDE_BIN = process.env.CLAUDE_BIN || join(homedir(), '.local', 'bin', 'claude')
+const LOGIN_HELPER = join(import.meta.dir, 'login-pty.py')
+const CRED_FILE = join(homedir(), '.claude', '.credentials.json')
+
+function credExpiry(): number {
+  try { return JSON.parse(readFileSync(CRED_FILE, 'utf8'))?.claudeAiOauth?.expiresAt ?? 0 } catch { return 0 }
+}
+
+function authEmail(): string {
+  try {
+    const r = spawnSync(CLAUDE_BIN, ['auth', 'status'], { encoding: 'utf8', timeout: 20000 })
+    const o = JSON.parse(r.stdout || '{}')
+    return o.loggedIn ? (o.email || 'ok') : ''
+  } catch { return '' }
+}
+
+type LoginFlow = {
+  proc: ReturnType<typeof spawn>
+  chatId: number
+  threadId: number
+  stage: 'await-url' | 'await-code' | 'exchanging'
+  preExpiry: number
+  timeout: ReturnType<typeof setTimeout>
+  outBuf: string
+}
+let activeLogin: LoginFlow | null = null
+
+function endLogin(): void {
+  if (!activeLogin) return
+  clearTimeout(activeLogin.timeout)
+  try { activeLogin.proc.kill('SIGKILL') } catch {}
+  activeLogin = null
+}
+
+async function startLogin(chatId: number, threadId: number): Promise<void> {
+  if (activeLogin) {
+    await bot.api.sendMessage(chatId, 'Логин уже идёт — пришли код из браузера, или подожди и запусти /login заново.',
+      { message_thread_id: threadId || undefined } as any).catch(() => {})
+    return
+  }
+  let proc: ReturnType<typeof spawn>
+  try {
+    proc = spawn('python3', [LOGIN_HELPER], { stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, CLAUDE_BIN } })
+  } catch (e) {
+    await bot.api.sendMessage(chatId, `❌ Не удалось запустить логин: ${e}`,
+      { message_thread_id: threadId || undefined } as any).catch(() => {})
+    return
+  }
+  const flow: LoginFlow = {
+    proc, chatId, threadId, stage: 'await-url', preExpiry: credExpiry(), outBuf: '',
+    timeout: setTimeout(() => {
+      void bot.api.sendMessage(chatId, '⌛ Время логина истекло. Запусти /login заново.',
+        { message_thread_id: threadId || undefined } as any).catch(() => {})
+      endLogin()
+    }, 320_000),
+  }
+  activeLogin = flow
+
+  proc.stdout?.on('data', (d: Buffer) => {
+    if (activeLogin !== flow) return
+    flow.outBuf += d.toString()
+    let nl: number
+    while ((nl = flow.outBuf.indexOf('\n')) >= 0) {
+      const line = flow.outBuf.slice(0, nl).trim()
+      flow.outBuf = flow.outBuf.slice(nl + 1)
+      if (!line) continue
+      if (line.startsWith('URL ')) {
+        flow.stage = 'await-code'
+        const url = line.slice(4).trim()
+        void bot.api.sendMessage(chatId,
+          '🔐 Вход в аккаунт Claude\n\n1) Открой ссылку и авторизуйся:\n' + url +
+          '\n\n2) Скопируй код со страницы и пришли его сюда одним сообщением.',
+          { message_thread_id: threadId || undefined, disable_web_page_preview: true } as any).catch(() => {})
+      } else if (line === 'DONE') {
+        void finishLogin()
+      }
+    }
+  })
+  proc.on('error', () => {
+    if (activeLogin !== flow) return
+    void bot.api.sendMessage(chatId, '❌ Ошибка процесса логина.',
+      { message_thread_id: threadId || undefined } as any).catch(() => {})
+    endLogin()
+  })
+}
+
+function submitLoginCode(code: string): void {
+  if (!activeLogin) return
+  activeLogin.stage = 'exchanging'
+  try { activeLogin.proc.stdin?.write(code.replace(/\s+/g, '') + '\n') } catch {}
+}
+
+async function finishLogin(): Promise<void> {
+  if (!activeLogin) return
+  const { chatId, threadId, preExpiry } = activeLogin
+  await new Promise(r => setTimeout(r, 600)) // let the credentials write land
+  const post = credExpiry()
+  endLogin()
+  if (post > preExpiry && post > Date.now()) {
+    const who = authEmail()
+    await bot.api.sendMessage(chatId,
+      `✅ Авторизация обновлена${who ? ' (' + who + ')' : ''}. Можешь продолжать — следующее сообщение уже пойдёт в работу.`,
+      { message_thread_id: threadId || undefined } as any).catch(() => {})
+  } else {
+    await bot.api.sendMessage(chatId,
+      '❌ Логин не завершился (код неверный или истёк). Запусти /login и попробуй ещё раз.',
+      { message_thread_id: threadId || undefined } as any).catch(() => {})
+  }
+}
+
+bot.command('login', async ctx => {
+  const gated = dmCommandGate(ctx)
+  if (!gated || !gated.access.allowFrom.includes(gated.senderId)) return
+  const chatId = ctx.chat?.id
+  if (!chatId) return
+  await startLogin(chatId, contextThreadId(ctx))
+})
+
 bot.command('start', async ctx => {
   if (!dmCommandGate(ctx)) return
   await ctx.reply(
@@ -1265,6 +1388,7 @@ bot.command('help', async ctx => {
     `Messages you send here route to a paired Claude Code session.\n\n` +
     `/start — pairing instructions\n` +
     `/status — pairing state\n` +
+    `/login — re-authenticate the Claude account (OAuth)\n` +
     `/effort, /model, /mode, /clear, /interrupt, /resume — drive the session`,
   )
 })
@@ -1840,6 +1964,18 @@ async function transcribeTgVoice(fileId: string): Promise<string | null> {
 }
 
 bot.on('message:text', async ctx => {
+  // Login code capture: while a login flow awaits the pasted OAuth code, the
+  // next plain message in that topic IS the code — feed it, don't route to CC.
+  if (activeLogin && activeLogin.stage === 'await-code') {
+    const g = dmCommandGate(ctx)
+    const code = ctx.message.text?.trim() ?? ''
+    if (g && g.access.allowFrom.includes(g.senderId) &&
+        contextThreadId(ctx) === activeLogin.threadId && code && !code.startsWith('/')) {
+      submitLoginCode(code)
+      await ctx.reply('⏳ Проверяю код…', { message_thread_id: activeLogin.threadId || undefined })
+      return
+    }
+  }
   if (ctx.message.text?.startsWith('/')) return // commands handled separately
   await handleInbound(ctx, ctx.message.text, undefined)
 })
@@ -1970,6 +2106,7 @@ void (async () => {
             { command: 'start', description: 'Welcome and setup guide' },
             { command: 'help', description: 'What this bot can do' },
             { command: 'status', description: 'Check your pairing state' },
+            { command: 'login', description: 'Re-authenticate the Claude account' },
             { command: 'health', description: 'Dispatcher health' },
             { command: 'effort', description: 'Set thinking effort' },
             { command: 'model', description: 'Pick model' },
