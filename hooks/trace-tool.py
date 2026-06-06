@@ -52,7 +52,7 @@ def _is_real_user(o):
     return False
 
 
-def last_assistant_narration(transcript_path):
+def last_assistant_narration(transcript_path, prefer="text", limit=100):
     """The agent's reasoning alongside the current tool call. In CC transcripts
     each block is its OWN assistant message (thinking / text / tool_use on
     separate lines), so we walk backwards to the nearest `text` block (the
@@ -86,13 +86,14 @@ def last_assistant_narration(transcript_path):
                 text_hit = b["text"]
             elif b.get("type") == "thinking" and (b.get("thinking") or "").strip() and thinking_hit is None:
                 thinking_hit = b["thinking"]
-        if text_hit:
-            break  # nearest visible narration wins
-    chosen = text_hit or thinking_hit
+        if (thinking_hit if prefer == "thinking" else text_hit):
+            break  # nearest block of the preferred kind wins
+    chosen = (thinking_hit or text_hit) if prefer == "thinking" else (text_hit or thinking_hit)
     if not chosen:
         return ""
     chosen = " ".join(chosen.split())
-    return (chosen[:99] + "…") if len(chosen) > 100 else chosen
+    # Show the TAIL (most recent words of the thought), not the head.
+    return ("…" + chosen[-(limit - 1):]) if len(chosen) > limit else chosen
 
 
 def short(s, n):
@@ -104,7 +105,7 @@ def label(tool, inp):
     if not isinstance(inp, dict):
         inp = {}
     if tool == "Bash":
-        return short(inp.get("command"), 70)
+        return short(inp.get("command"), 160)
     if tool in ("Read", "Edit", "Write", "NotebookEdit"):
         return os.path.basename(inp.get("file_path") or inp.get("notebook_path") or "")
     if tool in ("Grep", "Glob"):
@@ -136,6 +137,10 @@ def trace_file(thread):
 
 def active_file(thread):
     return f"/tmp/claude-tg-active-{thread}.txt"
+
+
+def think_file(thread):
+    return f"/tmp/claude-tg-think-{thread}.txt"
 
 
 def _atomic_write(path, text):
@@ -200,6 +205,16 @@ def main():
     else:  # PostToolUse (or unknown): tool finished → log it, drop the active one.
         append_trace(thread, f"• {body}")
         clear_active(thread)
+
+    # Capture the current turn's latest narration for the draft header. Extended
+    # thinking is encrypted in the transcript (empty + signature), so we use the
+    # visible narration — the prose the model writes as it works ("Now I'll …").
+    # Bounded to this turn; the tail (latest words) is what we show.
+    tpath = data.get("transcript_path")
+    if tpath:
+        reasoning = last_assistant_narration(tpath, prefer="text", limit=220)
+        if reasoning:
+            _atomic_write(think_file(thread), reasoning)
     return 0
 
 

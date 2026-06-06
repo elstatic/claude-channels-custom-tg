@@ -397,6 +397,27 @@ function consumeStatusMessage(): number | null {
 // only reappears when work actually continues, and never lingers after a
 // prompt/answer that ends the turn.
 
+// Finalization mode B: solidify the turn's working log (latest reasoning + the
+// command trace) into one permanent message, mirroring the live draft minus its
+// spinner, then clear those files so it isn't repeated. Returns null when empty.
+// Called by the FINAL (loud) reply so the terminal-style transcript stays in
+// history above the answer; interim (silent) replies and prompts don't trigger it.
+function solidifyWorkLog(): string | null {
+  if (!THREAD_ID) return null
+  let thought = ''
+  try { thought = readFileSync(`/tmp/claude-tg-think-${THREAD_ID}.txt`, 'utf8').trim() } catch {}
+  let trace = ''
+  try { trace = readFileSync(`/tmp/claude-tg-trace-${THREAD_ID}.txt`, 'utf8').trim() } catch {}
+  const parts: string[] = []
+  if (thought) parts.push(thought)
+  if (trace) parts.push(trace)
+  const log = parts.join('\n').trim()
+  if (!log) return null
+  try { writeFileSync(`/tmp/claude-tg-trace-${THREAD_ID}.txt`, '') } catch {}
+  try { writeFileSync(`/tmp/claude-tg-think-${THREAD_ID}.txt`, '') } catch {}
+  return log
+}
+
 // Live progress in chat is the native "печатает…" indicator only (above).
 // We deliberately do NOT scrape the Claude Code TUI pane for a trace: that
 // leaked CLI chrome (Tip:… lines, file paths, "Calling …" spinners) into the
@@ -684,6 +705,18 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         // morph it into the answer by editing it in place with the first chunk.
         // Mark it consumed first so the launcher's animator stops touching it.
         const statusMsgId = consumeStatusMessage()
+
+        // Finalization B: on the FINAL (non-silent) answer, leave the turn's
+        // working log as its own quiet message just above the answer. Interim
+        // (silent) replies skip this, so there's one transcript per turn.
+        if (!silent) {
+          const log = solidifyWorkLog()
+          if (log) {
+            try {
+              await bot.api.sendMessage(chat_id, log, { disable_notification: true } as any, AbortSignal.timeout(SEND_TIMEOUT_MS))
+            } catch {}
+          }
+        }
 
         try {
           for (let i = 0; i < chunks.length; i++) {

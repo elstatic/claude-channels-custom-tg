@@ -933,6 +933,13 @@ function activeFile(threadId: number): string {
   return `/tmp/claude-tg-active-${threadId}.txt`
 }
 
+// The model's CURRENT reasoning (extended-thinking tail, turn-bounded), written
+// by the trace hook from the live transcript. Read into the draft header. NOT a
+// TUI-pane scrape — that surfaced the previous reply text as stale "reasoning".
+function thinkFile(threadId: number): string {
+  return `/tmp/claude-tg-think-${threadId}.txt`
+}
+
 // Lift the agent's live reasoning straight off the Claude Code TUI by scraping
 // its tmux pane (session name mirrors spawnSession: claude_t<thread>). Pure
 // parsing lives in pane.ts; here we just run capture-pane and hand it over.
@@ -1202,24 +1209,26 @@ function renderDraft(threadId: number, tick = 0): string {
   // (top-right → bottom-right → bottom-left → top-left). No varying dot count,
   // and all frames share the Braille box so width/height stay rock-steady.
   const ORBIT = ['⣷', '⣯', '⣟', '⡿', '⢿', '⣻', '⣽', '⣾']
-  const cursor = ' ' + ORBIT[tick % ORBIT.length]
+  const spin = ORBIT[tick % ORBIT.length]
   let trace = ''
   try { trace = readFileSync(traceFile(threadId), 'utf8').trim() } catch {}
   const tools = trace ? trace.split('\n').filter(Boolean).map(d => `• ${d.replace(/^•\s*/, '')}`) : []
   let active = ''
   try { active = readFileSync(activeFile(threadId), 'utf8').trim() } catch {}
 
-  const head: string[] = tools.slice(-12)
-  if (active) head.push(`• ${active}`)
+  // Current reasoning: the latest extended-thinking block of THIS turn, written
+  // by the trace hook (trace-tool.py) from the transcript. Genuine reasoning —
+  // never the reply text, and turn-bounded so it can't go stale.
+  let thought = ''
+  try { thought = readFileSync(thinkFile(threadId), 'utf8').trim() } catch {}
 
-  // The DRAFT shows ONLY the live working log (finished steps + current action).
-  // We deliberately do NOT splice in the transcript answer-tail: it lags a turn
-  // behind and surfaces the PREVIOUS answer as stale draft content (the bug
-  // reported 2026-06-06). The real answer always lands as its own reply()
-  // message. Plain "• " bullets; the blinking ▌ tail is the only live element.
-  let body = head.join('\n').trim()
-  if (!body) body = 'Работаю…'   // capitalised + ellipsis, then the indicator
-  body += cursor
+  // Terminal-style layout: a live header line with the spinner at the START plus
+  // the current thought, then the command log below it. The real answer lands as
+  // its own reply() message — we never splice the (stale) transcript answer-tail.
+  const lead = thought || 'Работаю…'
+  const log: string[] = tools.slice(-12)
+  if (active) log.push(`• ${active}`)
+  let body = [`${spin} ${lead}`, ...log].join('\n').trim()
   return body.length > STATUS_MSG_CAP ? body.slice(0, STATUS_MSG_CAP) : body
 }
 
@@ -1240,6 +1249,7 @@ async function startStatusMessage(threadId: number, chatId: number): Promise<voi
   relayedTurnError.delete(threadId)
   atomicWrite(traceFile(threadId), '')
   try { rmSync(activeFile(threadId), { force: true }) } catch {}
+  try { rmSync(thinkFile(threadId), { force: true }) } catch {}
   atomicWrite(statusFile(threadId), JSON.stringify({
     chat_id: chatId, thread_id: threadId, consumed: false,
   }))
