@@ -3,6 +3,35 @@
 All notable changes to this project. SemVer pre-1.0: minor (0.x.0) for new
 features and breaking changes, patch (0.x.y) for bug fixes only.
 
+## 0.6.0 — 2026-06-06
+
+Drafts that solidify into messages, terminal-style live log, and a fix for
+the lingering draft.
+
+- **Working log solidifies on turn end (finalization mode B).** The live draft
+  is no longer just discarded: on the final (loud) `reply()`, the turn's
+  working log (latest narration + command trace) settles into one permanent,
+  silent message above the answer, mirroring the live draft minus its spinner.
+  Interim (silent) replies and prompts don't solidify — one transcript per turn.
+- **Narration header + command log in the draft.** The draft header shows the
+  current-turn narration (turn-bounded, written by the trace hook so it never
+  shows stale text), with the command log beneath and the spinner moved to the
+  front: `⣷ <thought>` / `• <commands>`.
+- **Live spinner.** Clockwise braille dots (`⣾⣽⣻⢿⡿⣟⣯⣷`) at the head of the
+  draft as the activity indicator; placeholder `Работаю…` before the first
+  narration lands.
+- **Arm-on-work + clean teardown.** The draft is (re-)armed only when the turn
+  does real work, gated on `status_consume`/`status_start` IPC, with a Stop-hook
+  backstop; interim updates use silent sends.
+- **Fix: the `Работаю…` draft no longer lingers under the answer.** A streamed
+  draft has no delete method — it clears when the real reply `sendMessage`
+  arrives (or expires in ~30s). The teardown was pushing *empty* text to
+  "clear" it, but per the Bot API empty text is a `Thinking…` placeholder that
+  resets the ~30s TTL, so that push (landing right after the answer) re-created
+  a live draft that hung below the reply. Now the reply message clears the draft
+  as the API intends, and in-flight draft frames are aborted on stop so a late
+  frame can't resurrect the bubble.
+
 ## 0.5.0 — 2026-06-05
 
 Native streaming, Telegram login, and error visibility.
