@@ -907,9 +907,11 @@ function stopSpawnTyping(threadId: number): void {
 // once consumed, the animator below self-stops so it never clobbers the answer.
 const STATUS_DOTS = ['.', '..', '...', '....', '.....']
 const STATUS_MAX_MS = 10 * 60_000
-// Edit cadence for the growing working-log message. ~1.8s reads as calm/CLI-like
-// and stays near Telegram's edit ceiling; 429s back off via retry_after below.
-const STATUS_TICK_MS = 1200
+// Push cadence for the live DRAFT. Tradeoff: each push re-sends the WHOLE draft,
+// and Telegram repaints it — so pushing too fast (≲500ms) makes the whole draft
+// visibly flicker (blank↔reappear). 1s is the calm zone: no flicker, and the
+// blinking ▌ cursor toggles once per push (≈2s blink). 429s back off below.
+const STATUS_TICK_MS = 1000
 // Braille spinner for the live cursor line (one frame per tick).
 const SPIN_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 type StatusEntry = { messageId: number; chatId: number; timer: ReturnType<typeof setInterval>; dot: number; startedAt: number; skipUntil?: number; draftId?: number }
@@ -1194,7 +1196,13 @@ function statusConsumed(threadId: number): boolean | null {
 // typing out below. Telegram animates only the changed tail, so the header sits
 // still while the answer streams — desktop/terminal-like. Plain text; min 1 char
 // (Telegram requires non-empty), capped under 4096.
-function renderDraft(threadId: number): string {
+function renderDraft(threadId: number, tick = 0): string {
+  // Canonical Braille "dots" spinner, CLOCKWISE: every frame is a full cell with
+  // EXACTLY 7 of 8 dots — the single empty position orbits the cell clockwise
+  // (top-right → bottom-right → bottom-left → top-left). No varying dot count,
+  // and all frames share the Braille box so width/height stay rock-steady.
+  const ORBIT = ['⣷', '⣯', '⣟', '⡿', '⢿', '⣻', '⣽', '⣾']
+  const cursor = ' ' + ORBIT[tick % ORBIT.length]
   let trace = ''
   try { trace = readFileSync(traceFile(threadId), 'utf8').trim() } catch {}
   const tools = trace ? trace.split('\n').filter(Boolean).map(d => `• ${d.replace(/^•\s*/, '')}`) : []
@@ -1202,21 +1210,23 @@ function renderDraft(threadId: number): string {
   try { active = readFileSync(activeFile(threadId), 'utf8').trim() } catch {}
 
   const head: string[] = tools.slice(-12)
-  if (active) head.push(`• ${active} …`)
+  if (active) head.push(`• ${active}`)
 
   // The DRAFT shows ONLY the live working log (finished steps + current action).
   // We deliberately do NOT splice in the transcript answer-tail: it lags a turn
   // behind and surfaces the PREVIOUS answer as stale draft content (the bug
   // reported 2026-06-06). The real answer always lands as its own reply()
-  // message. Plain "• " bullets, no emoji markers.
+  // message. Plain "• " bullets; the blinking ▌ tail is the only live element.
   let body = head.join('\n').trim()
-  if (!body) body = 'работаю…'
+  if (!body) body = 'Работаю…'   // capitalised + ellipsis, then the indicator
+  body += cursor
   return body.length > STATUS_MSG_CAP ? body.slice(0, STATUS_MSG_CAP) : body
 }
 
 // Push one draft frame. Same draft_id → Telegram animates the diff smoothly.
-function pushDraft(threadId: number, chatId: number, draftId: number): Promise<unknown> {
-  return bot.api.sendMessageDraft(chatId, draftId, renderDraft(threadId), {
+// `tick` advances the live braille cursor.
+function pushDraft(threadId: number, chatId: number, draftId: number, tick = 0): Promise<unknown> {
+  return bot.api.sendMessageDraft(chatId, draftId, renderDraft(threadId, tick), {
     message_thread_id: threadId || undefined,
   } as any)
 }
@@ -1235,7 +1245,7 @@ async function startStatusMessage(threadId: number, chatId: number): Promise<voi
   }))
   const draftId = threadId // stable, non-zero per topic
   const entry: StatusEntry = { messageId: 0, chatId, draftId, dot: 0, startedAt: Date.now(), timer: undefined as any }
-  void pushDraft(threadId, chatId, draftId).catch(() => {}) // first frame now
+  void pushDraft(threadId, chatId, draftId, entry.dot).catch(() => {}) // first frame now
   entry.timer = setInterval(() => {
     // Self-stop once server.ts/the Stop hook took over (consumed) or after the cap.
     if (statusConsumed(threadId) !== false || Date.now() - entry.startedAt > STATUS_MAX_MS) {
@@ -1252,7 +1262,7 @@ async function startStatusMessage(threadId: number, chatId: number): Promise<voi
     }
     if (entry.skipUntil && Date.now() < entry.skipUntil) return
     entry.dot++
-    void pushDraft(threadId, chatId, draftId).catch((e: any) => {
+    void pushDraft(threadId, chatId, draftId, entry.dot).catch((e: any) => {
       const ra = e?.parameters?.retry_after ?? (e instanceof GrammyError ? e.parameters?.retry_after : undefined)
       if (ra) entry.skipUntil = Date.now() + (ra * 1000) + 250
     })
