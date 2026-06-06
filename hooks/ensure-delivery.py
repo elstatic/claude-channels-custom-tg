@@ -9,7 +9,29 @@ the in-topic "💬 работаю…" status message (so it morphs into the answ
 normal reply); otherwise it sends a fresh message. Loop-guarded via
 stop_hook_active so it never fires twice for the same stop.
 """
-import sys, os, json, time, urllib.request, urllib.parse
+import sys, os, json, time, socket, urllib.request, urllib.parse
+
+
+def douse_draft(thread_id):
+    """Turn is over → stop any live working draft so none lingers (e.g. one a
+    trailing tool's PreToolUse armed). Sends status_consume over the dispatcher
+    socket, which stops the animator and clears the draft immediately. We do NOT
+    touch the status file here — the rescue logic below relies on its consumed
+    flag to decide whether a real delivery already happened. Best-effort."""
+    if not thread_id:
+        return
+    sock = os.path.join(
+        os.path.expanduser("~"), ".claude", "channels", "telegram", "dispatcher.sock"
+    )
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(0.5)
+        s.connect(sock)
+        s.sendall((json.dumps({"type": "status_consume", "thread_id": int(thread_id)}) + "\n").encode())
+        s.close()
+    except Exception:
+        pass
+
 
 DELIVERY_TOOLS = {
     "mcp__telegram-ss__reply",
@@ -46,6 +68,11 @@ def main():
     thread_id = os.environ.get("CLAUDE_THREAD_ID")
     if not token or not chat_id:
         return 0
+
+    # Turn is ending → make sure no live working draft is left hanging (covers
+    # the case where the last action was a tool, not a reply/prompt). Reply and
+    # prompts already douse their own draft; this is the backstop.
+    douse_draft(thread_id)
 
     # If reply() already morphed the status bubble it set consumed:true
     # synchronously — a real delivery happened, don't double-send. Reliable even

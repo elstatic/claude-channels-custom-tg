@@ -8,10 +8,37 @@ animator reads this file and renders it as an expandable blockquote under the
 the TUI (we read the structured tool_input the hook is handed). Must stay cheap:
 it runs after every single tool call.
 """
-import sys, os, json
+import sys, os, json, socket
 
 KEEP = 10
 SKIP_PREFIX = "mcp__telegram-ss__"  # our own reply/typing/etc — pure noise here
+
+
+def dispatcher_sock():
+    return os.path.join(
+        os.path.expanduser("~"), ".claude", "channels", "telegram", "dispatcher.sock"
+    )
+
+
+def arm_draft(thread, chat):
+    """Tell the dispatcher to (re)post the live working draft. Fires on every
+    real tool step; the dispatcher de-dupes, so it only actually arms a fresh
+    draft when none is live (i.e. right after a reply/prompt doused the previous
+    one). This is what makes the draft reappear ONLY when work continues — never
+    lingering after a turn-ending message. Best-effort; never blocks the tool."""
+    if not chat:
+        return
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(0.5)
+        s.connect(dispatcher_sock())
+        msg = json.dumps(
+            {"type": "status_start", "thread_id": int(thread), "chat_id": int(chat)}
+        )
+        s.sendall((msg + "\n").encode())
+        s.close()
+    except Exception:
+        pass
 
 
 def _is_real_user(o):
@@ -166,6 +193,10 @@ def main():
         # marker so long Bash/Agent calls visibly "work". The 💭 reasoning line
         # is added by the dispatcher at render time (it scrapes the live pane).
         set_active(thread, body)
+        # Re-arm the live draft the moment work continues (after a reply/prompt
+        # doused it). telegram-ss tools already returned above, so emit tools
+        # never trigger this — the action message stays the last thing.
+        arm_draft(thread, os.environ.get("CLAUDE_CHAT_ID"))
     else:  # PostToolUse (or unknown): tool finished → log it, drop the active one.
         append_trace(thread, f"• {body}")
         clear_active(thread)

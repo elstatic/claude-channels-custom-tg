@@ -364,8 +364,11 @@ function stopTyping(chat_id: string): void {
 // that message — mark it consumed (so the launcher's animator stops) and return
 // its id so the caller can edit it in place into the answer. Returns null when
 // there's no fresh status message to claim.
-function consumeStatusMessage(): number | null {
-  if (!THREAD_ID) return null
+// Mark the live status draft consumed and tell the dispatcher to clear it.
+// Returns true iff there was a live (unconsumed) draft we just froze — callers
+// use that to decide whether to re-arm it later (see freezeStatusForPrompt).
+function freezeStatusDraft(): boolean {
+  if (!THREAD_ID) return false
   const f = `/tmp/claude-tg-status-${THREAD_ID}.json`
   try {
     const o = JSON.parse(readFileSync(f, 'utf8'))
@@ -373,16 +376,26 @@ function consumeStatusMessage(): number | null {
       // Atomic write so the launcher loop / Stop hook never read a torn file.
       const tmp = `${f}.tmp.${process.pid}`
       try { writeFileSync(tmp, JSON.stringify({ ...o, consumed: true })); renameSync(tmp, f) } catch {}
-      // Stop the dispatcher's live working-log stream synchronously (also drops
-      // its ⏹ button), so the log freezes as a CLI transcript and the answer
-      // lands as its own separate message right below it.
+      // Stop the dispatcher's live working-log stream synchronously (also clears
+      // the ephemeral draft), so the answer/prompt lands as its own message
+      // without the "работаю…" draft lingering underneath it.
       try { ipcClient?.send({ type: 'status_consume', thread_id: THREAD_ID }) } catch {}
-      // Never morph the working log into the answer — always a fresh send.
-      return null
+      return true
     }
   } catch {}
+  return false
+}
+
+function consumeStatusMessage(): number | null {
+  // Never morph the working log into the answer — always a fresh send.
+  freezeStatusDraft()
   return null
 }
+
+// NOTE: re-arming the draft is NOT done here. A fresh draft is posted by the
+// PreToolUse hook the moment the turn does its next real step — so the draft
+// only reappears when work actually continues, and never lingers after a
+// prompt/answer that ends the turn.
 
 // Live progress in chat is the native "печатает…" indicator only (above).
 // We deliberately do NOT scrape the Claude Code TUI pane for a trace: that
@@ -446,6 +459,10 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'string',
             enum: ['text', 'markdownv2'],
             description: "Rendering mode. 'markdownv2' enables Telegram formatting (bold, italic, code, links). Caller must escape special chars per MarkdownV2 rules. Default: 'text' (plain, no escaping needed).",
+          },
+          silent: {
+            type: 'boolean',
+            description: 'Send without a notification sound (disable_notification). Pass TRUE for intermediate/progress messages so they don\'t spam the user; OMIT (loud) for the final answer of a turn and anything the user must act on.',
           },
         },
         required: ['chat_id', 'text'],
@@ -642,6 +659,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const files = (args.files as string[] | undefined) ?? []
         const format = (args.format as string | undefined) ?? 'text'
         const parseMode = format === 'markdownv2' ? 'MarkdownV2' as const : undefined
+        const silent = args.silent === true
 
         assertAllowedChat(chat_id)
         // Reply lands → stop the "печатает…" indicator.
@@ -696,6 +714,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
               ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
               ...(parseMode ? { parse_mode: parseMode } : {}),
               ...(tagged.entities ? { entities: tagged.entities } : {}),
+              ...(silent ? { disable_notification: true } : {}),
             } as any, AbortSignal.timeout(SEND_TIMEOUT_MS))
             sentIds.push(sent.message_id)
           }
@@ -724,6 +743,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           if (reply_to != null && replyMode !== 'off') {
             fd.set('reply_parameters', JSON.stringify({ message_id: reply_to }))
           }
+          if (silent) fd.set('disable_notification', 'true')
           const bytes = await Bun.file(f).arrayBuffer()
           const name = f.split('/').pop() || 'file'
           fd.set(field, new Blob([bytes]), name)
@@ -849,6 +869,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
         const chunkModeCfg = access.chunkMode ?? 'length'
         const parts = chunk(text, limit, chunkModeCfg)
+        // Clear the live "работаю…" draft first so the prompt+buttons stand on
+        // their own — otherwise the bottom-anchored draft lingers under them and
+        // keeps animating while we're actually just waiting on the user.
+        const hadStatusDraft = freezeStatusDraft()
         let promptMessageId: number | undefined
         for (let i = 0; i < parts.length; i++) {
           const isLast = i === parts.length - 1
@@ -873,6 +897,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             timeout,
           })
         })
+
+        // No manual re-arm: if the turn keeps working, the PreToolUse hook posts
+        // a fresh draft on the next real step; if it ends here, no draft lingers.
+        void hadStatusDraft
 
         return {
           content: [{

@@ -785,6 +785,12 @@ createIpcServer({
       stopStatusMessage(msg.thread_id)
       return
     }
+    if (msg.type === 'status_start') {
+      // A blocking prompt resolved and the turn is still working — re-arm a
+      // fresh live status draft so progress shows again below the prompt.
+      void startStatusMessage(msg.thread_id, msg.chat_id)
+      return
+    }
   },
   onDisconnect(sock) {
     const threadId = registry.detachSocket(sock)
@@ -1198,14 +1204,13 @@ function renderDraft(threadId: number): string {
   const head: string[] = tools.slice(-12)
   if (active) head.push(`• ${active} …`)
 
-  let answer = readLatestDraft(threadId)
-  if (answer.length > STATUS_DRAFT_CAP) answer = '…' + answer.slice(answer.length - STATUS_DRAFT_CAP)
-
-  const parts: string[] = []
-  if (head.length) parts.push(head.join('\n'))
-  if (answer) { if (head.length) parts.push('┄┄┄┄┄┄┄┄'); parts.push(answer) }
-  let body = parts.join('\n').trim()
-  if (!body) body = '⏳'
+  // The DRAFT shows ONLY the live working log (finished steps + current action).
+  // We deliberately do NOT splice in the transcript answer-tail: it lags a turn
+  // behind and surfaces the PREVIOUS answer as stale draft content (the bug
+  // reported 2026-06-06). The real answer always lands as its own reply()
+  // message. Plain "• " bullets, no emoji markers.
+  let body = head.join('\n').trim()
+  if (!body) body = 'работаю…'
   return body.length > STATUS_MSG_CAP ? body.slice(0, STATUS_MSG_CAP) : body
 }
 
