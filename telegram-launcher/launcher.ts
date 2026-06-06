@@ -914,7 +914,7 @@ const STATUS_MAX_MS = 10 * 60_000
 const STATUS_TICK_MS = 1000
 // Braille spinner for the live cursor line (one frame per tick).
 const SPIN_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
-type StatusEntry = { messageId: number; chatId: number; timer: ReturnType<typeof setInterval>; dot: number; startedAt: number; skipUntil?: number; draftId?: number }
+type StatusEntry = { messageId: number; chatId: number; timer: ReturnType<typeof setInterval>; dot: number; startedAt: number; skipUntil?: number; draftId?: number; abort?: AbortController }
 const statusMessages = new Map<number, StatusEntry>()
 
 function statusFile(threadId: number): string {
@@ -1234,10 +1234,10 @@ function renderDraft(threadId: number, tick = 0): string {
 
 // Push one draft frame. Same draft_id → Telegram animates the diff smoothly.
 // `tick` advances the live braille cursor.
-function pushDraft(threadId: number, chatId: number, draftId: number, tick = 0): Promise<unknown> {
+function pushDraft(threadId: number, chatId: number, draftId: number, tick = 0, signal?: AbortSignal): Promise<unknown> {
   return bot.api.sendMessageDraft(chatId, draftId, renderDraft(threadId, tick), {
     message_thread_id: threadId || undefined,
-  } as any)
+  } as any, signal)
 }
 
 async function startStatusMessage(threadId: number, chatId: number): Promise<void> {
@@ -1254,8 +1254,9 @@ async function startStatusMessage(threadId: number, chatId: number): Promise<voi
     chat_id: chatId, thread_id: threadId, consumed: false,
   }))
   const draftId = threadId // stable, non-zero per topic
-  const entry: StatusEntry = { messageId: 0, chatId, draftId, dot: 0, startedAt: Date.now(), timer: undefined as any }
-  void pushDraft(threadId, chatId, draftId, entry.dot).catch(() => {}) // first frame now
+  const abort = new AbortController()
+  const entry: StatusEntry = { messageId: 0, chatId, draftId, dot: 0, startedAt: Date.now(), timer: undefined as any, abort }
+  void pushDraft(threadId, chatId, draftId, entry.dot, abort.signal).catch(() => {}) // first frame now
   entry.timer = setInterval(() => {
     // Self-stop once server.ts/the Stop hook took over (consumed) or after the cap.
     if (statusConsumed(threadId) !== false || Date.now() - entry.startedAt > STATUS_MAX_MS) {
@@ -1272,7 +1273,7 @@ async function startStatusMessage(threadId: number, chatId: number): Promise<voi
     }
     if (entry.skipUntil && Date.now() < entry.skipUntil) return
     entry.dot++
-    void pushDraft(threadId, chatId, draftId, entry.dot).catch((e: any) => {
+    void pushDraft(threadId, chatId, draftId, entry.dot, entry.abort?.signal).catch((e: any) => {
       const ra = e?.parameters?.retry_after ?? (e instanceof GrammyError ? e.parameters?.retry_after : undefined)
       if (ra) entry.skipUntil = Date.now() + (ra * 1000) + 250
     })
@@ -1285,15 +1286,15 @@ function stopStatusMessage(threadId: number): void {
   if (!e) return
   clearInterval(e.timer)
   statusMessages.delete(threadId)
-  // Turn finished → clear the ephemeral draft (empty text) so it doesn't linger.
-  // The answer arrives as its own real message via reply(); the draft was only
-  // the live preview.
-  const draftId = e.draftId ?? threadId
-  if (draftId) {
-    void bot.api.sendMessageDraft(e.chatId, draftId, '', {
-      message_thread_id: threadId || undefined,
-    } as any).catch(() => {})
-  }
+  // Cancel any draft frame still in flight so it can't land at Telegram AFTER
+  // the real reply and resurrect the bubble.
+  try { e.abort?.abort() } catch {}
+  // Do NOT push an empty draft to "clear" it. Per the Bot API, empty text shows
+  // a "Thinking…" placeholder (NOT a clear) and resets the draft's ~30s TTL —
+  // that empty push, landing right after the answer, is exactly what left
+  // "Работаю…" lingering under the reply. There is no deleteDraft method: a
+  // streamed draft clears naturally when the real reply message arrives
+  // (sendMessage), and otherwise expires on its own in ~30s.
 }
 
 function startSpawnTimeout(threadId: number, chatId: number): void {
