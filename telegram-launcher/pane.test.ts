@@ -140,3 +140,67 @@ test('parsePaneError: normal prose and our own echo are NOT errors', () => {
   ].join('\n')
   expect(parsePaneError(belowBorder)).toBeNull()
 })
+
+import { parseDialog } from './pane'
+
+test('parseDialog: real /model picker → title + numbered options', () => {
+  const d = parseDialog(fixture('pane-model-picker.txt'))
+  expect(d).not.toBeNull()
+  expect(d!.question).toBe('Select model')
+  expect(d!.options.map(o => o.idx)).toEqual([1, 2, 3])
+  expect(d!.options[0].label.startsWith('1. Default')).toBe(true)
+  expect(d!.options[1].label).toContain('Sonnet')
+  expect(d!.options[2].label).toContain('Haiku')
+  // Column padding collapsed — no runs of 2+ spaces in labels.
+  for (const o of d!.options) expect(o.label).not.toMatch(/\s{2,}/)
+})
+
+test('parseDialog: no picker on screen → null', () => {
+  expect(parseDialog(fixture('pane-no-dialog.txt'))).toBeNull()
+})
+
+test('parseDialog: ignores stray numbered prose (not sequential 1..n)', () => {
+  const prose = [
+    '  I considered three options here.',
+    '  3. but only mentioned this one inline',
+    '────────────────────',
+    '❯ ',
+  ].join('\n')
+  expect(parseDialog(prose)).toBeNull()
+})
+
+test('parseDialog: synthetic two-option confirm picker', () => {
+  const dlg = [
+    '  Resume a conversation',
+    '',
+    '  ❯ 1. Fix the launcher bug',
+    '    2. Add the native menu',
+    '',
+    '  Enter to select · Esc to cancel',
+  ].join('\n')
+  const d = parseDialog(dlg)
+  expect(d!.question).toBe('Resume a conversation')
+  expect(d!.options).toEqual([
+    { idx: 1, label: '1. Fix the launcher bug' },
+    { idx: 2, label: '2. Add the native menu' },
+  ])
+})
+
+test('parseDialog: chained "switch model" cache-confirm (real wording)', () => {
+  // After picking a different model family, Claude opens this confirm. The
+  // bridge must mirror it as buttons (it was previously auto-dismissed).
+  const confirm = [
+    '  ⎿  Set model to Sonnet 4.6 and saved as your default for new sessions',
+    '',
+    '  This conversation is cached for the current model. Switching to Haiku 4.5',
+    '  will start a fresh cache.',
+    '',
+    '  ❯ 1. Yes, switch to Haiku 4.5',
+    '    2. No, go back',
+  ].join('\n')
+  const d = parseDialog(confirm)
+  expect(d).not.toBeNull()
+  expect(d!.options.map(o => o.idx)).toEqual([1, 2])
+  expect(d!.options[0].label).toContain('Yes, switch')
+  expect(d!.options[1].label).toContain('No, go back')
+})

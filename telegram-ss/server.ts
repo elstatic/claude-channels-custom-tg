@@ -23,6 +23,8 @@ import { homedir } from 'os'
 import { join, extname, sep } from 'path'
 import { connectToIpc } from '../telegram-launcher/ipc'
 import { JobStore, nextFireFrom } from '../telegram-launcher/jobs'
+import { parseDialog } from '../telegram-launcher/pane'
+import { spawnSync } from 'child_process'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -1096,6 +1098,57 @@ setInterval(() => {
 // ──────────────────────────────────────────────────────────────────────────
 
 let ipcClient: ReturnType<typeof connectToIpc> | null = null
+
+// ── tmux pane I/O ──────────────────────────────────────────────────────────
+// This MCP shares its tmux pane with the claude TUI it serves. The dispatcher
+// can't reach that pane (different process tree), so the bridge for TUI-routed
+// commands (/model, /resume, …) runs here: type the slash command, watch the
+// pane for the picker it opens, mirror it as inline buttons, and replay the
+// chosen key back into the pane.
+// Derive the pane from THREAD_ID, not $CLAUDE_TMUX_SESSION: the launcher always
+// names the session `claude_t<thread>` (launcher.ts spawnSession), and the env
+// var has been observed to carry a stale value from a prior spawn. THREAD_ID is
+// authoritative.
+const TMUX_SESSION = THREAD_ID ? `claude_t${THREAD_ID}` : (process.env.CLAUDE_TMUX_SESSION || '')
+const TMUX_TARGET = TMUX_SESSION ? `${TMUX_SESSION}:0.0` : ''
+
+function capturePaneText(): string {
+  if (!TMUX_TARGET) return ''
+  try {
+    const r = spawnSync('tmux', ['capture-pane', '-p', '-t', TMUX_TARGET], {
+      encoding: 'utf8', timeout: 3000,
+    })
+    return r.status === 0 ? (r.stdout ?? '') : ''
+  } catch { return '' }
+}
+
+// Block briefly so typed text registers before we hit Enter — otherwise the
+// slash-autocomplete popup can swallow the Enter. handleTuiSend is sync, so we
+// sleep synchronously.
+function sleepSync(ms: number): void {
+  try { spawnSync('sleep', [String(ms / 1000)]) } catch {}
+}
+
+function tuiSendSlash(slash: string): void {
+  if (!TMUX_TARGET) return
+  try {
+    // -l sends the string literally (slashes/spaces are not interpreted as
+    // tmux key names), then a separate Enter submits it.
+    spawnSync('tmux', ['send-keys', '-t', TMUX_TARGET, '-l', slash], { timeout: 3000 })
+    sleepSync(150)
+    spawnSync('tmux', ['send-keys', '-t', TMUX_TARGET, 'Enter'], { timeout: 3000 })
+  } catch {}
+}
+
+function tuiSendKeys(...keys: string[]): void {
+  if (!TMUX_TARGET || keys.length === 0) return
+  try {
+    // Bare keys are interpreted as tmux key names ("Enter", "Escape", "BTab")
+    // or, for a single character like a digit, that key — exactly what the
+    // picker navigation needs.
+    spawnSync('tmux', ['send-keys', '-t', TMUX_TARGET, ...keys], { timeout: 3000 })
+  } catch {}
+}
 
 // Watch the tmux pane for a Claude confirm dialog. If one renders, surface it
 // as inline buttons in this session's topic. Lives here (not in dispatcher)

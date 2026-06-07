@@ -1,0 +1,40 @@
+╭─── Claude Code v2.1.168 ─────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                    │ Tips for getting started                                        │
+│                Welcome back Sergey!                │ Ask Claude to create a new app or clone a repository            │
+│                                                    │ ─────────────────────────────────────────────────────────────── │
+│                       ▐▛███▜▌                      │ What's new                                                      │
+│                      ▝▜█████▛▘                     │ Bug fixes and reliability improvements                          │
+│                        ▘▘ ▝▝                       │ Bug fixes and reliability improvements                          │
+│     Sonnet 4.6 with low effort · Claude Max ·      │ Added `fallbackModel` setting to configure up to three fallbac… │
+│     um.sstepanov@gmail.com's Organization          │ /release-notes for more                                         │
+│                 /tmp/scratch_model                 │                                                                 │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ⚠ 1 setup issue: MCP · /doctor
+
+❯ /model
+  ⎿  Set model to Sonnet 4.6 and saved as your default for new sessions
+
+❯ /model
+  ⎿  Kept model as Sonnet 4.6
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents                                         ○ low · /effort
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

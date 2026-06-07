@@ -79,6 +79,65 @@ function cleanErrorLine(line: string): string {
 
 // Return the most recent error line in the pane (searching bottom-up, but above
 // the input box / spinner chrome), or null. Pure + testable.
+export interface TuiDialog {
+  /** Header/title shown above the choices, e.g. "Select model". */
+  question: string
+  /** Numbered choices; idx is the digit to press to pick it. */
+  options: { idx: number; label: string }[]
+}
+
+// Parse a Claude TUI selection picker (the dialog /model, /resume etc. open)
+// out of a capture-pane dump. The pickers render a numbered list:
+//
+//   Select model
+//   Switch between Claude models. …
+//
+//     1. Default (recommended)  Opus 4.8 with 1M context · …
+//   ❯ 2. Sonnet ✔               Sonnet 4.6 · …
+//     3. Haiku                  Haiku 4.5 · …
+//
+//   Enter to set as default · s to use this session only · Esc to cancel
+//
+// Returns null when no numbered picker is on screen. Kept pure so it's
+// unit-testable on real captured fixtures (see pane.test.ts / testdata).
+export function parseDialog(text: string): TuiDialog | null {
+  const lines = text.replace(/\r/g, '').split('\n').map(l => l.replace(/\s+$/, ''))
+  // A choice line: optional cursor (❯/›/>), then "N. <label>".
+  const OPT_RE = /^\s*[❯›>]?\s*(\d+)\.\s+(.*\S)\s*$/
+  const opts: { idx: number; label: string; line: number }[] = []
+  for (let i = 0; i < lines.length; i++) {
+    const m = OPT_RE.exec(lines[i])
+    if (!m) continue
+    const idx = Number(m[1])
+    // Collapse the picker's column padding into single spaces for a compact
+    // button label.
+    const label = m[2].replace(/\s{2,}/g, ' ').trim()
+    opts.push({ idx, label, line: i })
+  }
+  // Require a real picker: choices numbered 1,2,3… in order, at least two of
+  // them. This rejects stray "1." lines in prose or tool output.
+  if (opts.length < 2) return null
+  for (let k = 0; k < opts.length; k++) {
+    if (opts[k].idx !== k + 1) return null
+  }
+
+  // Title: walk up from the first choice, skip blanks, then take the first
+  // non-blank line that isn't a box border — that's the picker header.
+  let question = ''
+  for (let i = opts[0].line - 1; i >= 0; i--) {
+    const t = lines[i].trim()
+    if (!t) { if (question) break; else continue }
+    if (BORDER_RE.test(t)) { if (question) break; else continue }
+    question = t // keep climbing; the topmost contiguous line wins as title
+  }
+  if (!question) question = 'Select an option'
+
+  return {
+    question,
+    options: opts.map(o => ({ idx: o.idx, label: `${o.idx}. ${o.label}` })),
+  }
+}
+
 export function parsePaneError(text: string): string | null {
   const raw = text.replace(/\r/g, '').split('\n').map(l => l.replace(/\s+$/, ''))
   // Same region anchoring as parsePaneThinking: the conversation is above the

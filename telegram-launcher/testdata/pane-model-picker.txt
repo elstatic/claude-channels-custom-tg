@@ -1,0 +1,40 @@
+╭─── Claude Code v2.1.168 ─────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                    │ Tips for getting started                                        │
+│                Welcome back Sergey!                │ Ask Claude to create a new app or clone a repository            │
+│                                                    │ ─────────────────────────────────────────────────────────────── │
+│                       ▐▛███▜▌                      │ What's new                                                      │
+│                      ▝▜█████▛▘                     │ Bug fixes and reliability improvements                          │
+│                        ▘▘ ▝▝                       │ Bug fixes and reliability improvements                          │
+│     Sonnet 4.6 with low effort · Claude Max ·      │ Added `fallbackModel` setting to configure up to three fallbac… │
+│     um.sstepanov@gmail.com's Organization          │ /release-notes for more                                         │
+│                 /tmp/scratch_model                 │                                                                 │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ⚠ 1 setup issue: MCP · /doctor
+
+❯ /model
+  ⎿  Set model to Sonnet 4.6 and saved as your default for new sessions
+
+❯ /model
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Select model
+  Switch between Claude models. Your pick becomes the default for new sessions. For other/previous model names,
+  specify with --model.
+
+    1. Default (recommended)  Opus 4.8 with 1M context · Most capable for complex work
+  ❯ 2. Sonnet ✔               Sonnet 4.6 · Best for everyday tasks
+    3. Haiku                  Haiku 4.5 · Fastest for quick answers
+
+  ○ Low effort ←/→ to adjust
+
+  Enter to set as default · s to use this session only · Esc to cancel
+
+
+
+
+
+
+
+
+

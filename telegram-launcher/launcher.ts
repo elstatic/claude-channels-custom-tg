@@ -1833,7 +1833,13 @@ bot.on('callback_query:data', async ctx => {
     }
     const idx = tuiDlg[1]
     await ctx.answerCallbackQuery({ text: `→ ${idx}` })
-    ipcSend(threadId, { type: 'tui_send', mode: 'keys', payload: [idx, 'Enter'] })
+    // Send the digit ALONE — Claude's numbered pickers activate on the number
+    // key (no Enter needed). An extra Enter would blindly auto-confirm any
+    // chained dialog (e.g. the "switch model? this drops the cache" prompt)
+    // before we can mirror it. Instead, re-watch: if picking opens a follow-up
+    // dialog, surface it as a fresh set of buttons so the user confirms it too.
+    ipcSend(threadId, { type: 'tui_send', mode: 'keys', payload: [idx] })
+    ipcSend(threadId, { type: 'watch_dialog' })
     const msg = ctx.callbackQuery.message
     if (msg && 'text' in msg && typeof msg.text === 'string') {
       await ctx.editMessageText(`${msg.text}\n\n→ ${idx}`).catch(() => {})
@@ -2234,7 +2240,7 @@ void (async () => {
           process.stderr.write(`telegram-dispatcher: polling as @${info.username}\n`)
           // Tell the owner the bridge is back (boot or recovery from an outage).
           notifyOwner(wasDown ? `✅ Бридж восстановился, поллинг возобновлён (@${info.username}).` : `✅ Диспетчер запущен, поллинг активен (@${info.username}).`)
-          void bot.api.setMyCommands([
+          const COMMANDS = [
             { command: 'interrupt', description: '✋ Прервать текущий ход (Esc)' },
             { command: 'stop', description: '⏹ Остановить сессию в топике' },
             { command: 'model', description: '🧠 Выбрать модель' },
@@ -2251,8 +2257,17 @@ void (async () => {
             { command: 'health', description: 'Здоровье диспетчера' },
             { command: 'help', description: 'Что умеет бот' },
             { command: 'start', description: 'Приветствие и настройка' },
-          ], { scope: { type: 'all_private_chats' } }).catch(() => {})
-          // Make the ☰ button (left of the input) open the command list.
+          ]
+          // Register for BOTH private and group/supergroup scopes. Sessions live
+          // in forum topics; inside a topic the Telegram client resolves the
+          // slash-command menu via the group scope, not all_private_chats — so
+          // without all_group_chats the "/" menu was empty in topics (only the
+          // main DM showed commands).
+          void bot.api.setMyCommands(COMMANDS, { scope: { type: 'all_private_chats' } }).catch(() => {})
+          void bot.api.setMyCommands(COMMANDS, { scope: { type: 'all_group_chats' } }).catch(() => {})
+          // The ☰ menu button is a private-chat-only construct (the Bot API
+          // can't set it for groups/forum topics — there the commands surface
+          // via the "/" menu instead). Set the default for the DM.
           void bot.api.setChatMenuButton({ menu_button: { type: 'commands' } } as any).catch(() => {})
         },
       })
