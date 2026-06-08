@@ -3,6 +3,34 @@
 All notable changes to this project. SemVer pre-1.0: minor (0.x.0) for new
 features and breaking changes, patch (0.x.y) for bug fixes only.
 
+## 0.6.1 — 2026-06-08
+
+Native command menu that actually works: every slash command in the menu —
+including the model and resume pickers — now drives the session end-to-end
+through the TUI bridge, verified by Telethon e2e across all 16 commands.
+
+- **Fix: the TUI command bridge was never wired up.** `/model`, `/resume`,
+  `/clear`, `/mode`, `/interrupt` routed to server-side helpers that didn't
+  exist, so the MCP threw a `ReferenceError` while the dispatcher cheerfully
+  replied "Sent /model" — the commands looked alive but did nothing. Added the
+  missing tmux send/capture helpers and `parseDialog` (the numbered-picker
+  parser); picking a model now mirrors the chained "switch model? cache resets"
+  confirm as buttons instead of silently auto-confirming it. Commands are now
+  also registered for group scope, so "/" inside forum topics is no longer
+  empty.
+- **Fix: the topic-less (thread 0) session never showed pickers.** The dialog
+  watcher built its tmux target with `THREAD_ID ? … : envFallback`, which
+  treats the valid thread 0 as falsy and captures the wrong (stale) pane — so
+  `/model` and `/resume` produced no buttons in the General session. The pane
+  name is now derived unconditionally from `THREAD_ID` (`claude_t<id>`), which
+  the launcher always sets. Real topics (id ≠ 0) were unaffected.
+- **`/resume` session picker rendered as buttons.** The resume picker is a
+  non-numbered, arrow-navigated list of past sessions, so the numbered-picker
+  bridge couldn't drive it. Added `parseSessionPicker` (summary + metadata +
+  cursor) and a `tui_nav` IPC path: the MCP recomputes the cursor→target delta
+  from the live pane and sends ↑/↓ + Enter, so tapping a session button
+  actually resumes that session.
+
 ## 0.6.0 — 2026-06-06
 
 Drafts that solidify into messages, terminal-style live log, and a fix for
