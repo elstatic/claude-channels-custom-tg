@@ -1849,6 +1849,30 @@ bot.on('callback_query:data', async ctx => {
     return
   }
 
+  // /resume session-picker selection: tuidlgnav:<idx> (0-based position).
+  // Unlike tuidlg (press a digit), the resume picker is arrow-navigated, so the
+  // MCP recomputes the cursor delta from the live pane and sends ↑/↓ + Enter.
+  const tuiNav = /^tuidlgnav:(\d+)$/.exec(data)
+  if (tuiNav) {
+    if (!access.allowFrom.includes(senderId)) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized' })
+      return
+    }
+    const idx = Number(tuiNav[1])
+    await ctx.answerCallbackQuery({ text: `→ ${idx + 1}` })
+    ipcSend(threadId, { type: 'tui_nav', target: idx })
+    // Selecting a session can open a follow-up confirm in some builds — re-watch
+    // so it surfaces as buttons too rather than being silently auto-dismissed.
+    ipcSend(threadId, { type: 'watch_dialog' })
+    const msg = ctx.callbackQuery.message
+    if (msg && 'text' in msg && typeof msg.text === 'string') {
+      await ctx.editMessageText(`${msg.text}\n\n→ ${idx + 1}`).catch(() => {})
+    } else {
+      await ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => {})
+    }
+    return
+  }
+
   // ask_user / confirm / confirm_plan answer: q:<prompt_id>:<idx>
   const qm = /^q:([a-km-z]{5}):(\d+)$/.exec(data)
   if (qm) {

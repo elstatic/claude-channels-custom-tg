@@ -1,0 +1,24 @@
+
+❯ /resume
+
+────────────────────────────────────────────────────────────────────────────────
+  Resume session (1 of 49)
+  ╭──────────────────────────────────────────────────────────────────────────╮
+  │ ⌕ Search…                                                                │
+  ╰──────────────────────────────────────────────────────────────────────────╯
+
+  ❯ (session)
+    3 seconds ago · master · 818KB · /home/clawd/claude-tg/topic-130075
+
+    WARM-1780927725 ✓
+    12 minutes ago · master · 94.8KB · /home/clawd/claude-tg/root
+
+    typing started
+    1 hour ago · master · 2.8MB · /home/clawd/claude-tg/topic-130031
+
+  ↓ The script ran successfully (exit code 0, token refreshed). Per the job…
+    7 hours ago · master · 100.4KB · /home/clawd/claude-tg/topic-130064
+
+    Ctrl+A to only show current repo · Ctrl+B to only show current branch ·
+    Space to preview · Ctrl+R to rename · Type to search · Esc to cancel
+

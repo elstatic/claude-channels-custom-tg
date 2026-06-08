@@ -19,6 +19,10 @@ export type RegisterMsg = { type: 'register'; thread_id: number; chat_id: number
 export type InboundMsg = { type: 'inbound'; method: string; params: Record<string, unknown> }
 export type TuiSendMsg = { type: 'tui_send'; mode: 'slash' | 'keys'; payload: string | string[] }
 export type WatchDialogMsg = { type: 'watch_dialog' }
+// Navigate the /resume session picker to the entry at 0-based `target` and
+// select it. The MCP recomputes the cursor delta from the live pane and sends
+// the right number of ↑/↓ keys + Enter (the picker is not number-addressable).
+export type TuiNavMsg = { type: 'tui_nav'; target: number }
 export type OutboundDialogMsg = { type: 'outbound_dialog'; question: string; options: { idx: number; label: string }[] }
 export type PermissionReplyMsg = { type: 'permission_reply'; request_id: string; behavior: 'allow' | 'deny' }
 export type PromptAnswerMsg = { type: 'inbound'; method: 'notifications/claude/channel/prompt_answer'; params: { prompt_id: string; idx: number } }
@@ -36,7 +40,7 @@ export type StatusConsumeMsg = { type: 'status_consume'; thread_id: number }
 // is still working — ask the dispatcher to post a fresh live status draft.
 export type StatusStartMsg = { type: 'status_start'; thread_id: number; chat_id: number }
 
-export type DispatcherToMcp = InboundMsg | TuiSendMsg | WatchDialogMsg
+export type DispatcherToMcp = InboundMsg | TuiSendMsg | WatchDialogMsg | TuiNavMsg
 export type McpToDispatcher = RegisterMsg | OutboundDialogMsg | PermissionReplyMsg | TopicDeletedMsg | HistoryLogMsg | StatusConsumeMsg | StatusStartMsg
 
 // Line-buffered JSON reader. Calls handler(json) for each complete message.

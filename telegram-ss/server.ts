@@ -23,7 +23,7 @@ import { homedir } from 'os'
 import { join, extname, sep } from 'path'
 import { connectToIpc } from '../telegram-launcher/ipc'
 import { JobStore, nextFireFrom } from '../telegram-launcher/jobs'
-import { parseDialog } from '../telegram-launcher/pane'
+import { parseDialog, parseSessionPicker } from '../telegram-launcher/pane'
 import { spawnSync } from 'child_process'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
@@ -1109,7 +1109,12 @@ let ipcClient: ReturnType<typeof connectToIpc> | null = null
 // names the session `claude_t<thread>` (launcher.ts spawnSession), and the env
 // var has been observed to carry a stale value from a prior spawn. THREAD_ID is
 // authoritative.
-const TMUX_SESSION = THREAD_ID ? `claude_t${THREAD_ID}` : (process.env.CLAUDE_TMUX_SESSION || '')
+// NB: thread 0 (the topic-less General session) is a VALID session named
+// `claude_t0`. A `THREAD_ID ? …` test treats 0 as falsy and wrongly falls back
+// to the stale env var, so the dialog watcher captures the wrong (empty) pane
+// and /model//resume pickers never surface. Build the name unconditionally
+// from THREAD_ID, which the launcher always sets (CLAUDE_THREAD_ID).
+const TMUX_SESSION = `claude_t${THREAD_ID}`
 const TMUX_TARGET = TMUX_SESSION ? `${TMUX_SESSION}:0.0` : ''
 
 function capturePaneText(): string {
@@ -1161,18 +1166,50 @@ async function watchForDialogLocal(): Promise<void> {
     await new Promise(r => setTimeout(r, 500))
     const pane = capturePaneText()
     if (!pane) continue
-    const dlg = parseDialog(pane)
-    if (!dlg) continue
-    const kbd = new InlineKeyboard()
-    for (const opt of dlg.options) {
-      const label = opt.label.length > 60 ? opt.label.slice(0, 57) + '…' : opt.label
-      kbd.text(label, `tuidlg:${opt.idx}`).row()
-    }
     const chat_id = CHAT_ID_FROM_ENV
-    if (chat_id == null) return
-    await bot.api.sendMessage(chat_id, dlg.question, { reply_markup: kbd }).catch(() => {})
-    return
+    // Numbered picker (/model, /clear confirm, …): press the digit to select.
+    const dlg = parseDialog(pane)
+    if (dlg) {
+      const kbd = new InlineKeyboard()
+      for (const opt of dlg.options) {
+        const label = opt.label.length > 60 ? opt.label.slice(0, 57) + '…' : opt.label
+        kbd.text(label, `tuidlg:${opt.idx}`).row()
+      }
+      if (chat_id == null) return
+      await bot.api.sendMessage(chat_id, dlg.question, { reply_markup: kbd }).catch(() => {})
+      return
+    }
+    // Session picker (/resume): not number-addressable — arrow-navigated. Mirror
+    // each visible session as a button whose callback navigates by cursor delta.
+    const sp = parseSessionPicker(pane)
+    if (sp) {
+      const kbd = new InlineKeyboard()
+      for (const opt of sp.options) {
+        const trimmed = opt.label.length > 56 ? opt.label.slice(0, 53) + '…' : opt.label
+        kbd.text(`${opt.idx + 1}. ${trimmed}`, `tuidlgnav:${opt.idx}`).row()
+      }
+      if (chat_id == null) return
+      await bot.api.sendMessage(chat_id, sp.question, { reply_markup: kbd }).catch(() => {})
+      return
+    }
   }
+}
+
+// Navigate the /resume session picker to `target` (0-based) and select it.
+// Re-read the live pane so the cursor delta is correct even if the picker moved
+// since the buttons were rendered, then send ↑/↓ × delta and Enter.
+function handleTuiNav(target: number): void {
+  if (!TMUX_TARGET) return
+  const pane = capturePaneText()
+  const sp = parseSessionPicker(pane)
+  if (!sp) return
+  const delta = target - sp.cursor
+  const key = delta >= 0 ? 'Down' : 'Up'
+  for (let i = 0; i < Math.abs(delta); i++) {
+    tuiSendKeys(key)
+    sleepSync(60)
+  }
+  tuiSendKeys('Enter')
 }
 
 function handleTuiSend(mode: 'slash' | 'keys', payload: string | string[]): void {
@@ -1248,6 +1285,8 @@ ipcClient = connectToIpc({
       handleTuiSend(msg.mode, msg.payload)
     } else if (msg.type === 'watch_dialog') {
       void watchForDialogLocal()
+    } else if (msg.type === 'tui_nav') {
+      handleTuiNav(msg.target)
     }
   },
   onDisconnect() {

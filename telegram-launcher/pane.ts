@@ -138,6 +138,72 @@ export function parseDialog(text: string): TuiDialog | null {
   }
 }
 
+export interface SessionPicker {
+  question: string
+  /** 0-based index of the entry the picker cursor (❯) currently sits on. */
+  cursor: number
+  /** Visible session entries, top-to-bottom; idx is the 0-based position. */
+  options: { idx: number; label: string }[]
+}
+
+// Parse the /resume "Resume session" picker. Unlike /model it is NOT a numbered
+// list — it is a scrollable list of past sessions, each rendered as a summary
+// line followed by a metadata line, navigated with ↑/↓ + Enter:
+//
+//   Resume session (1 of 49)
+//   ╭───────────────────────╮
+//   │ ⌕ Search…             │
+//   ╰───────────────────────╯
+//
+//   ❯ (session)
+//     3 seconds ago · master · 818KB · /home/clawd/claude-tg/topic-130075
+//
+//     WARM-1780927725 ✓
+//     12 minutes ago · master · 94.8KB · /home/clawd/claude-tg/root
+//
+// The summary line may be prefixed with the cursor (❯) or a scroll arrow (↓/↑).
+// The metadata line is the strong anchor: "<rel-time> ago ·". Returns the
+// visible entries plus which one the cursor is on, so the caller can navigate
+// by the cursor→target delta. Returns null when no resume picker is on screen.
+// Pure + testable (see pane.test.ts / testdata/pane-resume-picker.txt).
+const RESUME_META_RE = /\bago\b\s*·/
+const RESUME_CURSOR_RE = /^❯/
+
+export function parseSessionPicker(text: string): SessionPicker | null {
+  const lines = text.replace(/\r/g, '').split('\n').map(l => l.replace(/\s+$/, ''))
+  // Require the picker header so we never false-positive on prose that happens
+  // to contain "… ago ·".
+  if (!lines.some(l => /Resume session/i.test(l))) return null
+
+  const entries: { label: string; selected: boolean }[] = []
+  for (let i = 0; i < lines.length; i++) {
+    if (!RESUME_META_RE.test(lines[i])) continue
+    // The summary line is the nearest non-blank line above the metadata line.
+    let label = ''
+    let selected = false
+    for (let j = i - 1; j >= 0; j--) {
+      const s = lines[j].trim()
+      if (!s) continue
+      if (BORDER_RE.test(s)) break          // hit the search-box chrome
+      if (RESUME_META_RE.test(lines[j])) break // back-to-back meta = no summary
+      selected = RESUME_CURSOR_RE.test(s)
+      // Strip the leading cursor (❯) or scroll arrow (↓/↑) glyph + spaces.
+      label = s.replace(/^[❯↓↑›>]\s*/, '').trim()
+      break
+    }
+    entries.push({ label: label || '(session)', selected })
+  }
+  if (entries.length === 0) return null
+
+  let cursor = entries.findIndex(e => e.selected)
+  if (cursor < 0) cursor = 0
+  return {
+    question: 'Resume session',
+    cursor,
+    options: entries.map((e, k) => ({ idx: k, label: e.label })),
+  }
+}
+
 export function parsePaneError(text: string): string | null {
   const raw = text.replace(/\r/g, '').split('\n').map(l => l.replace(/\s+$/, ''))
   // Same region anchoring as parsePaneThinking: the conversation is above the

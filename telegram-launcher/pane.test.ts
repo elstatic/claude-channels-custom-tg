@@ -141,7 +141,7 @@ test('parsePaneError: normal prose and our own echo are NOT errors', () => {
   expect(parsePaneError(belowBorder)).toBeNull()
 })
 
-import { parseDialog } from './pane'
+import { parseDialog, parseSessionPicker } from './pane'
 
 test('parseDialog: real /model picker → title + numbered options', () => {
   const d = parseDialog(fixture('pane-model-picker.txt'))
@@ -203,4 +203,42 @@ test('parseDialog: chained "switch model" cache-confirm (real wording)', () => {
   expect(d!.options.map(o => o.idx)).toEqual([1, 2])
   expect(d!.options[0].label).toContain('Yes, switch')
   expect(d!.options[1].label).toContain('No, go back')
+})
+
+// ── /resume session picker (non-numbered, arrow-navigated) ───────────────────
+
+test('parseSessionPicker: real /resume picker → entries + cursor', () => {
+  const p = parseSessionPicker(fixture('pane-resume-picker.txt'))
+  expect(p).not.toBeNull()
+  expect(p!.question).toBe('Resume session')
+  // Four sessions visible in the captured screenful.
+  expect(p!.options.length).toBe(4)
+  expect(p!.options.map(o => o.idx)).toEqual([0, 1, 2, 3])
+  // Cursor (❯) is on the first/most-recent entry.
+  expect(p!.cursor).toBe(0)
+  // Summary labels: cursor + scroll-arrow glyphs stripped, text preserved.
+  expect(p!.options[0].label).toBe('(session)')
+  expect(p!.options[1].label).toBe('WARM-1780927725 ✓')
+  expect(p!.options[2].label).toBe('typing started')
+  // The 4th entry's summary is prefixed with a ↓ scroll arrow in the TUI — it
+  // must be stripped, not kept as part of the label.
+  expect(p!.options[3].label.startsWith('↓')).toBe(false)
+  expect(p!.options[3].label).toContain('script ran successfully')
+})
+
+test('parseSessionPicker: parseDialog does NOT match the resume picker', () => {
+  // The two pickers are disjoint: /resume has no numbered options, so the
+  // numbered-picker parser must return null (the bridge falls through to
+  // parseSessionPicker).
+  expect(parseDialog(fixture('pane-resume-picker.txt'))).toBeNull()
+})
+
+test('parseSessionPicker: no resume header → null (no false positives)', () => {
+  // Prose that happens to contain "… ago ·" but no picker header.
+  const prose = [
+    '  I shipped that change 3 days ago · the build is green now.',
+    '────────────────────',
+    '❯ ',
+  ].join('\n')
+  expect(parseSessionPicker(prose)).toBeNull()
 })
