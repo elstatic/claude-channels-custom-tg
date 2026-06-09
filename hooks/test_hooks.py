@@ -158,6 +158,20 @@ check("silent tool-only turn → no send", methods(run_hook([USER, asst(None, "B
 multi = run_hook([USER, asst("Считаю строки"), asst(None, "Bash"), TOOLRES, asst("Итог: 1896 строк")])
 check("delivers only final text block", multi == [("sendMessage", "Итог: 1896 строк")])
 
+# REGRESSION: a scheduled-job fire must NOT rescue a leaked prose tail (no 6am
+# ping). Detected via the "[scheduled job …]" marker in the boundary user msg.
+CRON_USER = {"type": "user", "message": {"role": "user",
+             "content": "<channel source=\"telegram-ss\" user=\"cron\">[scheduled job x76gy7] refresh token, stay silent on success</channel>"}}
+check("cron fire + leaked prose → no send",
+      methods(run_hook([CRON_USER, asst("The script ran successfully, no reply needed.")])) == [])
+# Same, but signalled purely by the dispatcher flag file (marker stripped).
+TC = "555111"
+fp = f"/tmp/claude-tg-cron-{TC}.flag"
+open(fp, "w").write("x76gy7")
+check("cron flag file → no send",
+      methods(run_hook([USER, asst("internal note")], thread=TC)) == [])
+check("cron flag removed at turn end", not os.path.exists(fp))
+
 # REGRESSION: a consumed status bubble means reply already delivered → no send
 TH = "987654"
 sfp = f"/tmp/claude-tg-status-{TH}.json"

@@ -116,6 +116,28 @@ def main():
                 last_user = i
     after = msgs[last_user + 1:] if last_user >= 0 else msgs
 
+    # Cron-originated turn? The dispatcher prefixes the synthetic fire with
+    # "[scheduled job <id>]" and drops a flag file. Such jobs must produce ONLY
+    # their own explicit reply() — never a rescued prose tail like "script ran
+    # successfully…" pinging the user at 6am. If this is a scheduled fire, clear
+    # the flag and bail without delivering; a job that wants to talk calls reply()
+    # itself (which sets delivered/consumed and never reaches this hook anyway).
+    flag = f"/tmp/claude-tg-cron-{thread_id}.flag" if thread_id else None
+    is_cron = False
+    if last_user >= 0:
+        c = msgs[last_user].get("message", {}).get("content")
+        ctext = c if isinstance(c, str) else (
+            " ".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text")
+            if isinstance(c, list) else "")
+        if "[scheduled job " in ctext:
+            is_cron = True
+    if flag and os.path.exists(flag):
+        is_cron = True
+        try: os.remove(flag)
+        except Exception: pass
+    if is_cron:
+        return 0  # scheduled job: stay silent unless it called reply() itself
+
     delivered = False
     text_parts = []
     for o in after:

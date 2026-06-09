@@ -610,6 +610,11 @@ async function fireJob(job: ScheduledJob): Promise<void> {
       },
     },
   }
+  // Mark this as a cron-originated turn so the session (work-log solidify) and
+  // the Stop hook (answer rescue) stay quiet: a scheduled job must produce ONLY
+  // its own explicit reply() messages — never trace clutter or leaked prose at
+  // 6am. The Stop hook removes the flag at turn end; server.ts mtime-guards it.
+  try { writeFileSync(`/tmp/claude-tg-cron-${threadId}.flag`, job.id) } catch {}
   const rec = registry.get(threadId)
   if (rec?.socket) {
     ipcSend(threadId, inboundMsg)

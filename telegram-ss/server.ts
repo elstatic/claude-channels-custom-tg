@@ -406,6 +406,14 @@ function consumeStatusMessage(): number | null {
 // history above the answer; interim (silent) replies and prompts don't trigger it.
 function solidifyWorkLog(): string | null {
   if (!THREAD_ID) return null
+  // Cron-originated turns suppress the work-log entirely — a scheduled job posts
+  // only its explicit reply(), no "Now let me…" narration + command trace. The
+  // dispatcher writes this flag at fire time and the Stop hook clears it at turn
+  // end; the mtime guard stops a stale flag from muting a later interactive turn.
+  try {
+    const st = statSync(`/tmp/claude-tg-cron-${THREAD_ID}.flag`)
+    if (Date.now() - st.mtimeMs < 10 * 60_000) return null
+  } catch {}
   let thought = ''
   try { thought = readFileSync(`/tmp/claude-tg-think-${THREAD_ID}.txt`, 'utf8').trim() } catch {}
   let trace = ''
