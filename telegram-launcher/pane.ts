@@ -55,18 +55,29 @@ function isProse(line: string): boolean {
 // the user just sees the spinner forever — so the dispatcher relays it to chat.
 // Conservative signature list: only unambiguous failures, never normal prose
 // that happens to contain the word "error".
+//
+// CRITICAL — these are matched against the line AFTER its leading CC marker
+// glyph is stripped (cleanErrorLine) and ANCHORED at the start (^). A genuine
+// Claude Code error banner LEADS with the error text ("API Error: 500 …",
+// "There's an issue with the selected model …"); assistant prose that merely
+// *mentions* such a phrase buries it mid-sentence ("…I saw an Internal server
+// error in the log…"). Anchoring is what stops a topic that is DISCUSSING
+// errors — every dev topic of this very bridge — from relaying its own prose
+// as an outage. Don't add un-anchored or mid-line phrase signatures here: real
+// API failures are all prefixed "API Error:" in the TUI, so /^API Error/
+// already covers 500/529/overloaded/rate-limit/model_not_found/etc.
 const ERROR_SIGNATURES = [
-  /API Error/i,
-  /Please run \/login/i,
-  /Invalid authentication/i,
-  /Failed to authenticate/i,
-  /Credit balance is too low/i,
-  /\boverloaded(_error)?\b/i,
-  /rate[ _]?limit/i,
-  /quota/i,
-  /\b(401|403|429|500|503|529)\b.*\berror\b/i,
-  /\berror\b.*\b(401|403|429|500|503|529)\b/i,
-  /Internal server error/i,
+  /^API Error/i,
+  /^Please run \/login/i,
+  /^Invalid API key/i,
+  /^Invalid authentication/i,
+  /^Failed to authenticate/i,
+  /^Credit balance is too low/i,
+  /^Overloaded\b/i,
+  // Pinned model retired/disabled by Anthropic. CC's `fallbackModel` chain
+  // normally recovers transparently; this banner only shows when every model
+  // in the chain is gone — surface it loudly instead of a frozen spinner.
+  /^There's an issue with the selected model/i,
 ]
 
 /** Strip CC's leading marker glyph + collapse whitespace for a chat-friendly line. */
@@ -204,6 +215,45 @@ export function parseSessionPicker(text: string): SessionPicker | null {
   }
 }
 
+// Detect a STUCK, unsubmitted prompt buffer. In this bridge the user never
+// types into the TUI directly — every prompt arrives as a channel notification
+// that Claude Code injects into the input box and submits itself. When a message
+// lands mid-turn, Claude queues it in the input; normally it auto-submits once
+// the turn ends, but occasionally the submit never fires and the text sits in
+// the prompt forever (the streaming "draft" bubble never finalizes and the
+// topic looks frozen). A plain Enter won't rescue it — only clear+retype does.
+//
+// Returns the buffered prompt text when the TUI is IDLE yet the input box holds
+// text; null when the input is empty, the turn is still running ("esc to
+// interrupt"), or an interactive picker/dialog legitimately owns the prompt.
+// Pure + testable (see pane.test.ts: pane-idle.txt is exactly this case).
+export function parseStuckInput(text: string): string | null {
+  const lines = text.replace(/\r/g, '').split('\n').map(l => l.replace(/\s+$/, ''))
+  // Turn still running → the queued message will submit on its own; not stuck.
+  // NOTE: we key off the footer, NOT isSpinnerLine — the idle "Crunched for 2m"
+  // caption is spinner-SHAPED too and would mask a genuine stuck input.
+  if (lines.some(l => /esc to interrupt/i.test(l))) return null
+  // A picker/dialog (/model, /resume, permission prompt) renders inside the
+  // prompt region and must never be clobbered.
+  if (parseDialog(text) || parseSessionPicker(text)) return null
+  // The input box is the content between the LAST two box borders; the footer
+  // sits below the final border. Earlier "❯ …" lines are echoed past commands.
+  const borders: number[] = []
+  for (let i = 0; i < lines.length; i++) if (BORDER_RE.test(lines[i].trim())) borders.push(i)
+  if (borders.length < 2) return null
+  const top = borders[borders.length - 2]
+  const bottom = borders[borders.length - 1]
+  const content = lines.slice(top + 1, bottom)
+  const caret = content.findIndex(l => /^\s*❯/.test(l))
+  if (caret < 0) return null
+  // First line: drop the "❯ " caret; later lines are wrapped continuations.
+  const buf = content.slice(caret)
+    .map((l, k) => (k === 0 ? l.replace(/^\s*❯\s?/, '') : l))
+    .join('\n')
+    .trim()
+  return buf || null
+}
+
 export function parsePaneError(text: string): string | null {
   const raw = text.replace(/\r/g, '').split('\n').map(l => l.replace(/\s+$/, ''))
   // Same region anchoring as parsePaneThinking: the conversation is above the
@@ -223,8 +273,10 @@ export function parsePaneError(text: string): string | null {
     if (!t) continue
     if (/^[←→]/.test(t)) continue                 // queued/echoed inbound markers
     if (/(^|\s)telegram-ss\s*·/.test(t)) continue // our own channel echo
-    if (ERROR_SIGNATURES.some(re => re.test(t))) {
-      const msg = cleanErrorLine(t)
+    // Strip the leading glyph FIRST, then match anchored: a real banner leads
+    // with the error text, prose buries it mid-line (see ERROR_SIGNATURES note).
+    const msg = cleanErrorLine(t)
+    if (ERROR_SIGNATURES.some(re => re.test(msg))) {
       if (msg.length > 400) return msg.slice(0, 399) + '…'
       return msg
     }

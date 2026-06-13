@@ -22,7 +22,7 @@
 import { Bot, GrammyError, InlineKeyboard, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { spawn, spawnSync } from 'child_process'
-import { parsePaneThinking, parsePaneError } from './pane'
+import { parsePaneThinking, parsePaneError, parseStuckInput } from './pane'
 import {
   readFileSync, writeFileSync, mkdirSync, chmodSync, renameSync, readdirSync, rmSync, statSync,
   openSync, readSync, fstatSync, closeSync,
@@ -570,6 +570,101 @@ setTimeout(sweepIdleSessions, 60_000)
 setInterval(sweepIdleSessions, IDLE_SWEEP_INTERVAL_MS).unref()
 void sweepDeletedTopics  // keep symbol — fireJob still uses probeTopicAlive
 
+// ── Stuck-input watchdog ──────────────────────────────────────────────────
+// In this bridge the user never types into the TUI — every prompt arrives as a
+// channel notification that Claude Code injects into the input box and submits
+// itself. When a message lands mid-turn, Claude queues it in the prompt; it
+// normally auto-submits once the turn ends, but occasionally the submit never
+// fires and the text sits there forever — the streaming "draft" bubble never
+// finalizes and the topic looks frozen ("в отправке"). A plain Enter won't
+// rescue it; only clear+retype does (see tuiResubmit in server.ts).
+//
+// We arm a per-thread record at every live-session forward (noteForwarded).
+// The sweep below polls each armed pane; once it sees the input IDLE-yet-
+// non-empty for two consecutive ticks (~STUCK_MS), and the buffered text still
+// matches what we forwarded, it asks the MCP to clear+retype+submit it.
+type ForwardRec = { content: string; stuckSince?: number; attempts: number }
+const forwardedInput = new Map<number, ForwardRec>()
+const STUCK_INPUT_SWEEP_MS = 5000
+const STUCK_INPUT_MIN_MS = 5000   // idle-with-text must persist this long
+const STUCK_INPUT_MAX_ATTEMPTS = 3
+
+function noteForwarded(threadId: number, content: string): void {
+  forwardedInput.set(threadId, { content, attempts: 0 })
+}
+
+// Collapse whitespace so a wrapped/scraped prompt line still compares equal to
+// the original message (the pane inserts line breaks at the box width).
+function collapseWs(s: string): string {
+  return s.replace(/\s+/g, ' ').trim()
+}
+
+function sweepStuckInput(): void {
+  for (const rec of registry.all()) {
+    const threadId = rec.threadId
+    if (!threadId || !rec.socket) continue
+    const fwd = forwardedInput.get(threadId)
+    if (!fwd) continue
+
+    const pane = tmuxCaptureRaw(threadId)
+    // Turn still running: our message may legitimately be queued in the prompt
+    // and will submit on its own. Keep watching, but don't count it as stuck.
+    if (/esc to interrupt/i.test(pane)) { fwd.stuckSince = undefined; continue }
+
+    const stuck = parseStuckInput(pane)
+    if (stuck == null) {
+      // Idle with an empty prompt ⇒ the message submitted and the turn is done.
+      forwardedInput.delete(threadId)
+      continue
+    }
+
+    // Only act on OUR injected message — a buffered prompt whose head doesn't
+    // match what we forwarded isn't something we should clobber.
+    const head = collapseWs(stuck).slice(0, 32)
+    if (head.length === 0 || !collapseWs(fwd.content).startsWith(head)) {
+      // Unknown text in the prompt while idle — leave it, keep watching once.
+      continue
+    }
+
+    const now = Date.now()
+    if (fwd.stuckSince == null) { fwd.stuckSince = now; continue }
+    if (now - fwd.stuckSince < STUCK_INPUT_MIN_MS) continue
+
+    if (fwd.attempts >= STUCK_INPUT_MAX_ATTEMPTS) {
+      process.stderr.write(`telegram-dispatcher: thread ${threadId} prompt still stuck after ${fwd.attempts} resubmits, giving up\n`)
+      forwardedInput.delete(threadId)
+      continue
+    }
+    fwd.attempts++
+    fwd.stuckSince = now  // re-measure before the next attempt
+    process.stderr.write(`telegram-dispatcher: thread ${threadId} stuck prompt — resubmitting (attempt ${fwd.attempts})\n`)
+    resubmitPrompt(threadId, fwd.content)
+  }
+}
+
+// Recover a wedged prompt by driving the topic's tmux pane directly (same pane
+// tmuxCaptureRaw reads). A channel message injected mid-turn can land in the
+// input box and never auto-submit; a plain Enter won't rescue it. The sequence
+// that works: home (C-a) → kill-to-EOL (C-k) to wipe the stale text, then
+// retype the message literally and Enter. Done here (not via the MCP) so the
+// fix applies to every live session as soon as the dispatcher restarts.
+function resubmitPrompt(threadId: number, text: string): void {
+  if (!text) return
+  const target = `claude_t${threadId}:0.0`
+  const key = (...a: string[]) => {
+    try { spawnSync('tmux', ['send-keys', '-t', target, ...a], { timeout: 3000 }) } catch {}
+  }
+  // Brief gaps: the TUI render is async, so Enter must land after the retype
+  // has been applied (mirrors tuiSendSlash's 150ms text→Enter gap in server.ts).
+  key('C-a'); Bun.sleepSync(40)
+  key('C-k'); Bun.sleepSync(60)
+  key('-l', text); Bun.sleepSync(150)
+  key('Enter')
+}
+
+setTimeout(sweepStuckInput, 20_000)
+setInterval(sweepStuckInput, STUCK_INPUT_SWEEP_MS).unref()
+
 // ── Cron scheduler ───────────────────────────────────────────────────────
 // Periodically (every 60s) walks `jobs` and fires any whose nextFireAt has
 // passed. A "fire" = inject a synthetic channel notification into the
@@ -979,8 +1074,11 @@ function maybeRelaySessionError(threadId: number, chatId: number): boolean {
   if (relayedTurnError.get(threadId) === err) return true // already sent this turn
   relayedTurnError.set(threadId, err)
   const isAuth = /login|authenticat|401/i.test(err)
+  const isModelGone = /selected model|model_not_found/i.test(err)
   const body = isAuth
     ? `⚠️ Сессия не авторизована:\n${err}\n\nНужен ре-логин — отправь /login в этот топик.`
+    : isModelGone
+    ? `⚠️ Модель недоступна (и фоллбэк-цепочка тоже исчерпана):\n${err}\n\nПерепинь ANTHROPIC_MODEL / fallbackModel в ~/.claude/settings.json на живую модель.`
     : `⚠️ Ошибка сессии:\n${err}`
   void bot.api.sendMessage(chatId, body, { message_thread_id: threadId || undefined } as any).catch(() => {})
   return true
@@ -2027,6 +2125,11 @@ async function handleInbound(
   const rec = registry.get(threadId)
   if (rec?.socket) {
     ipcSend(threadId, { type: 'inbound', ...inboundMsg })
+    // Arm the stuck-input watchdog: if Claude injects this message into the
+    // prompt mid-turn and the auto-submit never fires, the watchdog resubmits
+    // this exact text. Only live-session forwards can wedge this way (a cold
+    // start drains its queue on register, never via the input box).
+    if (threadId) noteForwarded(threadId, text)
     return
   }
 

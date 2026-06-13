@@ -1,7 +1,7 @@
 import { test, expect } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { parsePaneThinking, parsePaneError } from './pane'
+import { parsePaneThinking, parsePaneError, parseStuckInput } from './pane'
 
 const fixture = (n: string) => readFileSync(join(import.meta.dir, 'testdata', n), 'utf8')
 
@@ -241,4 +241,58 @@ test('parseSessionPicker: no resume header → null (no false positives)', () =>
     '❯ ',
   ].join('\n')
   expect(parseSessionPicker(prose)).toBeNull()
+})
+
+// ── parseStuckInput ────────────────────────────────────────────────────────
+
+test('stuck input: idle pane with text in the prompt → returns the buffered text', () => {
+  // pane-idle.txt is an idle footer ("← for agents") with an unsubmitted prompt
+  // sitting in the input box — exactly the wedge the watchdog recovers.
+  const r = parseStuckInput(fixture('pane-idle.txt'))
+  expect(r).toBe('Загляни в launcher.ts, есть ли там задел под HTTP')
+})
+
+test('stuck input: busy pane ("esc to interrupt") → null (turn still running)', () => {
+  expect(parseStuckInput(fixture('pane-working.txt'))).toBeNull()
+})
+
+test('stuck input: idle pane with an empty prompt → null (nothing queued)', () => {
+  expect(parseStuckInput(fixture('pane-idle-empty.txt'))).toBeNull()
+})
+
+test('stuck input: a model picker owns the prompt → null', () => {
+  expect(parseStuckInput(fixture('pane-model-picker.txt'))).toBeNull()
+})
+
+test('stuck input: a resume picker owns the prompt → null', () => {
+  expect(parseStuckInput(fixture('pane-resume-picker.txt'))).toBeNull()
+})
+
+test('stuck input: earlier "❯ /cmd" echoes are ignored; only the live box counts', () => {
+  // pane-no-dialog.txt has past "❯ /model" echoes above, empty live input box.
+  expect(parseStuckInput(fixture('pane-no-dialog.txt'))).toBeNull()
+})
+
+test('parsePaneError: disabled/retired model (404 model_not_found) is detected', () => {
+  const tui = [
+    '  Earlier narration.',
+    "● There's an issue with the selected model (claude-fable-5). It may not exist or you may not have access to it. Run /model to pick a different model.",
+    '✻ Churned for 1s',
+    '────────────────────────────',
+    '❯ ',
+    '────────────────────────────',
+  ].join('\n')
+  expect(parsePaneError(tui)).toMatch(/issue with the selected model/i)
+  expect(parsePaneError('● API Error: 404 model_not_found')).toMatch(/model_not_found|404/i)
+})
+
+test('parsePaneError: assistant PROSE about errors is NOT relayed as an outage', () => {
+  // Regression: a dev topic discussing the error detector itself used to trip
+  // it. These phrases appear mid-sentence (not as a CC banner) → must be null.
+  expect(parsePaneError('● Детектор ловил строку с Internal server error в логе.')).toBeNull()
+  expect(parsePaneError('● Баг: при model_not_found фоллбэк-цепочка не срабатывает.')).toBeNull()
+  expect(parsePaneError('● The selected model issue only fires on a real 404.')).toBeNull()
+  expect(parsePaneError('● I hit a rate limit and a 429 error while testing quota.')).toBeNull()
+  // …but a genuine leading banner in the same topic is still caught.
+  expect(parsePaneError('● API Error: 500 Internal server error')).toMatch(/Internal server error/i)
 })
