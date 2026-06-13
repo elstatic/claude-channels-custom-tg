@@ -422,33 +422,97 @@ function readPpid(pid: number): number | null {
   }
 }
 
+// Tear down all DISPATCHER-SIDE state for a thread: the live draft animator,
+// the spawn/queue guards, and the on-disk coord files. Touches no processes —
+// safe to call when the session is already dead. This is the cure for a
+// "frozen" topic: when a session crashes (e.g. EIO on REPL unmount) the
+// onDisconnect path used to leave the status-draft interval ticking forever
+// (drafts kept flowing) and a half-set spawn guard blocking new messages from
+// queueing. Marking the status file consumed first makes any external reader
+// (statusConsumed-based self-stop) bail too.
+function teardownThread(threadId: number): void {
+  try {
+    const o = JSON.parse(readFileSync(statusFile(threadId), 'utf8'))
+    atomicWrite(statusFile(threadId), JSON.stringify({ ...o, consumed: true }))
+  } catch {}
+  stopStatusMessage(threadId)
+  spawningThreads.delete(threadId)
+  pendingInboundQueue.delete(threadId)
+  forwardedInput.delete(threadId)
+  stopSpawnTyping(threadId)
+  cleanupCoordFiles(threadId)
+}
+
 function killSession(threadId: number, opts?: { silent?: boolean }): void {
   const rec = registry.get(threadId)
-  if (!rec) return
-  if (opts?.silent) expectedDisconnects.add(threadId)
-  try {
-    spawnSync('tmux', ['kill-session', '-t', rec.tmuxSession], { stdio: 'ignore' })
-  } catch {}
-  // Belt-and-braces: if the tmux server itself is dead the kill-session above
-  // is a no-op, leaving claude + its MCP child running with their pty orphaned.
-  // Walk up the process tree from the recorded MCP pid (MCP → bun wrapper →
-  // claude) and SIGTERM claude directly so the whole subtree winds down.
-  // If tmux was alive, claude has already exited by the time this fires and
-  // every process.kill below no-ops.
-  if (rec.pid) {
-    const mcpPid = rec.pid
-    setTimeout(() => {
-      try { process.kill(mcpPid, 0) } catch { return } // already gone — good
-      const wrapperPid = readPpid(mcpPid)
-      const claudePid = wrapperPid ? readPpid(wrapperPid) : null
-      const target = claudePid && claudePid > 1 ? claudePid : mcpPid
-      try { process.kill(target, 'SIGTERM') } catch {}
-      setTimeout(() => { try { process.kill(target, 'SIGKILL') } catch {} }, 3000)
-    }, 1000)
+  if (rec) {
+    if (opts?.silent) expectedDisconnects.add(threadId)
+    try {
+      spawnSync('tmux', ['kill-session', '-t', rec.tmuxSession], { stdio: 'ignore' })
+    } catch {}
+    // Belt-and-braces: if the tmux server itself is dead the kill-session above
+    // is a no-op, leaving claude + its MCP child running with their pty orphaned.
+    // Walk up the process tree from the recorded MCP pid (MCP → bun wrapper →
+    // claude) and SIGTERM claude directly so the whole subtree winds down.
+    // If tmux was alive, claude has already exited by the time this fires and
+    // every process.kill below no-ops.
+    if (rec.pid) {
+      const mcpPid = rec.pid
+      setTimeout(() => {
+        try { process.kill(mcpPid, 0) } catch { return } // already gone — good
+        const wrapperPid = readPpid(mcpPid)
+        const claudePid = wrapperPid ? readPpid(wrapperPid) : null
+        const target = claudePid && claudePid > 1 ? claudePid : mcpPid
+        try { process.kill(target, 'SIGTERM') } catch {}
+        setTimeout(() => { try { process.kill(target, 'SIGKILL') } catch {} }, 3000)
+      }, 1000)
+    }
+    registry.remove(threadId)
+  } else {
+    // No registry record — session already dead/never-registered, but a topic
+    // can still be "frozen" with a stray tmux session and a runaway draft loop.
+    // Reap the tmux session by its conventional name; teardownThread below
+    // clears the rest. /stop and the ⏹ escalation both rely on this branch.
+    try {
+      spawnSync('tmux', ['kill-session', '-t', `claude_t${threadId}`], { stdio: 'ignore' })
+    } catch {}
   }
-  registry.remove(threadId)
+  // ALWAYS run dispatcher-side teardown — with OR without a registry record.
+  teardownThread(threadId)
+}
+
+// Stop is TOP PRIORITY and must win even when the TUI is wedged. Two-stage:
+//   1. Soft interrupt — send Esc on BOTH channels (the IPC/MCP path AND straight
+//      into the tmux pane), because the IPC path itself may be the thing that's
+//      hung. Stop the animator and mark the bubble consumed immediately.
+//   2. Escalate — after a short grace, re-read the pane DIRECTLY via tmux. If the
+//      turn is still running ("esc to interrupt" still on screen) the TUI ignored
+//      Esc: hard-kill the session. killSession survives a dead/wedged TUI (it
+//      kill-sessions tmux and SIGKILLs the claude process tree), so the session
+//      always closes. A turn that DID stop on Esc leaves the session intact.
+const STOP_ESCALATE_MS = 3500
+function forceStop(threadId: number, chatId: number): void {
+  ipcSend(threadId, { type: 'tui_send', mode: 'keys', payload: ['Escape'] })
+  try {
+    spawnSync('tmux', ['send-keys', '-t', `claude_t${threadId}:0.0`, 'Escape'], { timeout: 2000 })
+  } catch {}
   stopStatusMessage(threadId)
-  cleanupCoordFiles(threadId)
+  try {
+    const o = JSON.parse(readFileSync(statusFile(threadId), 'utf8'))
+    atomicWrite(statusFile(threadId), JSON.stringify({ ...o, consumed: true }))
+  } catch {}
+  setTimeout(() => {
+    if (!registry.get(threadId)) return // session already gone — soft stop / crash won
+    if (!/esc to interrupt/i.test(tmuxCaptureRaw(threadId))) return // turn ended cleanly
+    process.stderr.write(`telegram-dispatcher: ⏹ soft-stop ignored by wedged TUI on thread ${threadId} — hard-killing\n`)
+    killSession(threadId, { silent: true })
+    if (chatId) {
+      void bot.api.sendMessage(chatId, '⏹ TUI не реагировал на Esc — сессия принудительно закрыта. Следующее сообщение поднимет новую.', {
+        message_thread_id: threadId || undefined,
+        reply_markup: sessionMenu(),
+      }).catch(() => {})
+    }
+  }, STOP_ESCALATE_MS)
 }
 
 // ── Topic-existence probe ─────────────────────────────────────────────────
@@ -898,7 +962,7 @@ createIpcServer({
     process.stderr.write(`telegram-dispatcher: MCP for thread=${threadId} disconnected\n`)
     if (expectedDisconnects.has(threadId)) {
       // We initiated this (via /stop or similar) — user has already been
-      // told what's happening.
+      // told what's happening, and killSession already ran teardownThread.
       expectedDisconnects.delete(threadId)
       registry.remove(threadId)
       return
@@ -914,6 +978,11 @@ createIpcServer({
       if (cur && !cur.socket) {
         notifySessionEnded(cur)
         registry.remove(threadId)
+        // CRITICAL: an unexpected death (e.g. EIO on REPL unmount) must also
+        // stop the live draft animator and clear the spawn/queue guards.
+        // Without this the topic "freezes": drafts keep flowing and new
+        // messages never queue. This was the 130853 bug.
+        teardownThread(threadId)
       }
     }, SESSION_DEATH_GRACE_MS)
     pendingDeathNotifications.set(threadId, timer)
@@ -1810,15 +1879,14 @@ bot.command('stop', async ctx => {
   const gated = dmCommandGate(ctx)
   if (!gated || !gated.access.allowFrom.includes(gated.senderId)) return
   const threadId = contextThreadId(ctx)
-  const rec = registry.get(threadId)
-  if (!rec) {
-    await ctx.reply('No session is running in this thread.', {
-      message_thread_id: threadId || undefined,
-    })
-    return
-  }
+  // killSession is now idempotent and cleans up even with NO registry record,
+  // so /stop always works — including on a crashed/frozen topic where the only
+  // thing left is a runaway draft loop and a wedged queue.
+  const had = !!registry.get(threadId)
   killSession(threadId, { silent: true })
-  await ctx.reply('Сессия остановлена. tmux/Claude убиты, файлы в cwd сохранены. На следующее сообщение в этом топике поднимется новая (или жми Continue ниже).', {
+  await ctx.reply(had
+    ? 'Сессия остановлена. tmux/Claude убиты, файлы в cwd сохранены. На следующее сообщение в этом топике поднимется новая (или жми Continue ниже).'
+    : 'Активной сессии не было — почистил подвисший статус и очередь. Следующее сообщение поднимет новую.', {
     message_thread_id: threadId || undefined,
     reply_markup: sessionMenu(),
   })
@@ -1843,14 +1911,8 @@ bot.on('callback_query:data', async ctx => {
     }
     const t = Number(stopTurn[1])
     await ctx.answerCallbackQuery({ text: '⏹ Останавливаю…' })
-    // Interrupt the live turn (Esc into the TUI) and stop the animator.
-    ipcSend(t, { type: 'tui_send', mode: 'keys', payload: ['Escape'] })
-    stopStatusMessage(t)
-    // Mark the bubble consumed so a late reply doesn't re-edit it.
-    try {
-      const o = JSON.parse(readFileSync(statusFile(t), 'utf8'))
-      atomicWrite(statusFile(t), JSON.stringify({ ...o, consumed: true }))
-    } catch {}
+    // Soft-interrupt now, hard-kill if the wedged TUI ignores Esc (see forceStop).
+    forceStop(t, chatId ?? 0)
     try {
       await ctx.editMessageText('⏹ Остановлено пользователем', { reply_markup: { inline_keyboard: [] } } as any)
     } catch {}
