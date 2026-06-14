@@ -1404,12 +1404,64 @@ function renderDraft(threadId: number, tick = 0): string {
   return body.length > STATUS_MSG_CAP ? body.slice(0, STATUS_MSG_CAP) : body
 }
 
+// Rich-message variant of the live draft (Bot API 10.1 sendRichMessageDraft).
+// The header line (spinner + current thought) is plain Markdown; the action log
+// goes inside a fenced code block so arbitrary tool/command text can NEVER be
+// mis-parsed as Markdown. The fence is always balanced (we trim the log body,
+// not the whole string).
+function renderDraftRich(threadId: number, tick = 0): string {
+  const ORBIT = ['⣷', '⣯', '⣟', '⡿', '⢿', '⣻', '⣽', '⣾']
+  const spin = ORBIT[tick % ORBIT.length]
+  let trace = ''
+  try { trace = readFileSync(traceFile(threadId), 'utf8').trim() } catch {}
+  const tools = trace ? trace.split('\n').filter(Boolean).map(d => `• ${d.replace(/^•\s*/, '')}`) : []
+  let active = ''
+  try { active = readFileSync(activeFile(threadId), 'utf8').trim() } catch {}
+  let thought = ''
+  try { thought = readFileSync(thinkFile(threadId), 'utf8').trim() } catch {}
+  let lead = thought || 'Работаю…'
+  if (lead.length > STATUS_DRAFT_CAP) lead = '…' + lead.slice(lead.length - STATUS_DRAFT_CAP)
+  const log = tools.slice(-12)
+  if (active) log.push(`• ${active}`)
+  let body = `${spin} ${lead}`
+  if (log.length) {
+    let block = log.join('\n')
+    const budget = STATUS_MSG_CAP - body.length - 10
+    if (budget > 0 && block.length > budget) block = block.slice(block.length - budget)
+    body += '\n```\n' + block + '\n```'
+  }
+  return body
+}
+
 // Push one draft frame. Same draft_id → Telegram animates the diff smoothly.
-// `tick` advances the live braille cursor.
-function pushDraft(threadId: number, chatId: number, draftId: number, tick = 0, signal?: AbortSignal): Promise<unknown> {
-  return bot.api.sendMessageDraft(chatId, draftId, renderDraft(threadId, tick), {
-    message_thread_id: threadId || undefined,
-  } as any, signal)
+// `tick` advances the live braille cursor. Prefers the native Rich draft; on any
+// API error degrades to the plain sendMessageDraft so the bubble never breaks.
+// retry_after is normalised so the caller's backoff still fires.
+async function pushDraft(threadId: number, chatId: number, draftId: number, tick = 0, signal?: AbortSignal): Promise<unknown> {
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${TOKEN}/sendRichMessageDraft`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        draft_id: draftId,
+        message_thread_id: threadId || undefined,
+        rich_message: { markdown: renderDraftRich(threadId, tick) },
+      }),
+      signal,
+    })
+    const j: any = await res.json()
+    if (j.ok) return j.result
+    if (j.parameters?.retry_after) throw { parameters: { retry_after: j.parameters.retry_after } }
+    throw new Error(j.description || 'sendRichMessageDraft failed')
+  } catch (e: any) {
+    if (e?.parameters?.retry_after) throw e          // let the loop back off
+    if (e?.name === 'AbortError') throw e            // cancelled in flight
+    // Degrade to the plain draft (same draft_id) so streaming keeps working.
+    return bot.api.sendMessageDraft(chatId, draftId, renderDraft(threadId, tick), {
+      message_thread_id: threadId || undefined,
+    } as any, signal)
+  }
 }
 
 async function startStatusMessage(threadId: number, chatId: number): Promise<void> {
