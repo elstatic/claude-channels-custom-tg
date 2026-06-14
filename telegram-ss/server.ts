@@ -25,6 +25,7 @@ import { connectToIpc } from '../telegram-launcher/ipc'
 import { JobStore, nextFireFrom } from '../telegram-launcher/jobs'
 import { parseDialog, parseSessionPicker } from '../telegram-launcher/pane'
 import { spawnSync } from 'child_process'
+import { mdToHtml, chunkMarkdown } from './render'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -81,10 +82,13 @@ function threadOpt<T extends object>(extra?: T): T & { message_thread_id?: numbe
 // with parse_mode. No-op when there's no topic (THREAD_ID 0).
 function withTopicTag(
   s: string,
-  parseMode?: 'MarkdownV2',
+  parseMode?: 'MarkdownV2' | 'HTML',
 ): { text: string; entities?: any[] } {
   if (!THREAD_ID) return { text: s }
   const id = String(THREAD_ID)
+  if (parseMode === 'HTML') {
+    return { text: `${s}\n\n🧵 <code>${id}</code>` }
+  }
   if (parseMode === 'MarkdownV2') {
     return { text: `${s}\n\n🧵 \`${id}\`` }
   }
@@ -488,8 +492,8 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           format: {
             type: 'string',
-            enum: ['text', 'markdownv2'],
-            description: "Rendering mode. 'markdownv2' enables Telegram formatting (bold, italic, code, links). Caller must escape special chars per MarkdownV2 rules. Default: 'text' (plain, no escaping needed).",
+            enum: ['markdown', 'text', 'markdownv2'],
+            description: "Rendering mode. DEFAULT 'markdown': just write normal GitHub-flavoured Markdown (headers, **bold**, *italic*, ~~strike~~, ||spoiler||, `code`, fenced ```code``` blocks, [links](url), > quotes, bulleted/nested lists, GFM tables, ![images](url)) — the bridge renders it to Telegram's HTML subset and escapes for you, so NO manual escaping and a render glitch falls back to plain text instead of dropping. 'text' = raw plain (opt out of formatting). 'markdownv2' = passthrough for callers who already hand-escaped MarkdownV2.",
           },
           silent: {
             type: 'boolean',
@@ -534,8 +538,8 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           text: { type: 'string' },
           format: {
             type: 'string',
-            enum: ['text', 'markdownv2'],
-            description: "Rendering mode. 'markdownv2' enables Telegram formatting (bold, italic, code, links). Caller must escape special chars per MarkdownV2 rules. Default: 'text' (plain, no escaping needed).",
+            enum: ['text', 'markdown', 'markdownv2'],
+            description: "Rendering mode. 'markdown' — normal GitHub-flavoured Markdown, converted to Telegram HTML by the bridge (no manual escaping). 'markdownv2' — raw MarkdownV2, caller must hand-escape. 'text' (default) — plain. (Default is plain here because interim edits are usually short status pings; pass 'markdown' when editing in rich content.)",
           },
         },
         required: ['chat_id', 'message_id', 'text'],
@@ -688,8 +692,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const text = args.text as string
         const reply_to = args.reply_to != null ? Number(args.reply_to) : undefined
         const files = (args.files as string[] | undefined) ?? []
-        const format = (args.format as string | undefined) ?? 'text'
-        const parseMode = format === 'markdownv2' ? 'MarkdownV2' as const : undefined
+        // Default renders the agent's Markdown to Telegram HTML. 'text' = raw
+        // plain (opt out); 'markdownv2' = passthrough for pre-escaped callers.
+        const format = (args.format as string | undefined) ?? 'markdown'
+        const parseMode =
+          format === 'markdownv2' ? 'MarkdownV2' as const
+          : format === 'text' ? undefined
+          : 'HTML' as const
         const silent = args.silent === true
 
         assertAllowedChat(chat_id)
@@ -705,10 +714,18 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         }
 
         const access = loadAccess()
-        const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
+        const rawLimit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
+        // HTML conversion inflates length with tags; chunk the source markdown a
+        // bit shorter so the rendered message stays under Telegram's 4096 cap.
+        const limit = parseMode === 'HTML' ? Math.min(rawLimit, 3500) : rawLimit
         const mode = access.chunkMode ?? 'length'
         const replyMode = access.replyToMode ?? 'first'
-        const chunks = chunk(text, limit, mode)
+        // markdown mode: split the RAW markdown fence/table-aware so a chunk never
+        // cuts a ``` block or table, then render each chunk to HTML on its own
+        // (balanced tags never span messages). Other modes chunk the text as-is.
+        const chunks = parseMode === 'HTML'
+          ? chunkMarkdown(text, limit)
+          : chunk(text, limit, mode)
         const sentIds: number[] = []
 
         // If the dispatcher posted an in-topic "💬 работаю…" status message,
@@ -728,16 +745,36 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           }
         }
 
+        // Safety net for markdown mode: if Telegram rejects a chunk's HTML (a bad
+        // entity) the raw chunk is hard-split and re-sent as plain text, so a
+        // render bug can never drop a message.
+        const sendPlainFallback = async (raw: string, isLast: boolean, replyHere: boolean) => {
+          const parts = chunk(raw, rawLimit, 'length')
+          for (let j = 0; j < parts.length; j++) {
+            const tail = isLast && j === parts.length - 1
+            const t = tail ? withTopicTag(parts[j], undefined) : { text: parts[j], entities: undefined as any[] | undefined }
+            const sent = await bot.api.sendMessage(chat_id, t.text, {
+              ...(replyHere && j === 0 ? { reply_parameters: { message_id: reply_to } } : {}),
+              ...(t.entities ? { entities: t.entities } : {}),
+              ...(silent ? { disable_notification: true } : {}),
+            } as any, AbortSignal.timeout(SEND_TIMEOUT_MS))
+            sentIds.push(sent.message_id)
+          }
+        }
+
         try {
           for (let i = 0; i < chunks.length; i++) {
+            const isLast = i === chunks.length - 1
             const shouldReplyTo =
               reply_to != null &&
               replyMode !== 'off' &&
               (replyMode === 'all' || i === 0)
-            // Tap-to-copy topic-id footer on the LAST chunk only (one per answer).
-            const tagged = i === chunks.length - 1
-              ? withTopicTag(chunks[i], parseMode)
-              : { text: chunks[i] as string, entities: undefined as any[] | undefined }
+            // Render this chunk (markdown→HTML) and add the tap-to-copy topic-id
+            // footer on the LAST chunk only (one per answer).
+            const body = parseMode === 'HTML' ? mdToHtml(chunks[i] as string) : (chunks[i] as string)
+            const tagged = isLast
+              ? withTopicTag(body, parseMode)
+              : { text: body, entities: undefined as any[] | undefined }
             if (i === 0 && statusMsgId != null) {
               try {
                 await bot.api.editMessageText(chat_id, statusMsgId, tagged.text, {
@@ -749,17 +786,27 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
                 sentIds.push(statusMsgId)
                 continue
               } catch {
-                // Status message gone/uneditable — fall through to a normal send
-                // so the reply still lands.
+                // Status message gone/uneditable, or HTML rejected — fall through
+                // to a normal send (which itself has the plain fallback below).
               }
             }
-            const sent = await bot.api.sendMessage(chat_id, tagged.text, {
-              ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
-              ...(parseMode ? { parse_mode: parseMode } : {}),
-              ...(tagged.entities ? { entities: tagged.entities } : {}),
-              ...(silent ? { disable_notification: true } : {}),
-            } as any, AbortSignal.timeout(SEND_TIMEOUT_MS))
-            sentIds.push(sent.message_id)
+            try {
+              const sent = await bot.api.sendMessage(chat_id, tagged.text, {
+                ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
+                ...(parseMode ? { parse_mode: parseMode } : {}),
+                ...(tagged.entities ? { entities: tagged.entities } : {}),
+                ...(silent ? { disable_notification: true } : {}),
+              } as any, AbortSignal.timeout(SEND_TIMEOUT_MS))
+              sentIds.push(sent.message_id)
+            } catch (sendErr) {
+              // Only HTML mode can fail on a malformed entity we can recover from
+              // by dropping to plain text; other modes surface the error.
+              if (parseMode === 'HTML') {
+                await sendPlainFallback(chunks[i] as string, isLast, shouldReplyTo)
+              } else {
+                throw sendErr
+              }
+            }
           }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err)
@@ -842,11 +889,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       case 'edit_message': {
         assertAllowedChat(args.chat_id as string)
         const editFormat = (args.format as string | undefined) ?? 'text'
-        const editParseMode = editFormat === 'markdownv2' ? 'MarkdownV2' as const : undefined
+        const editParseMode =
+          editFormat === 'markdownv2' ? 'MarkdownV2' as const
+          : editFormat === 'markdown' ? 'HTML' as const
+          : undefined
+        const editText =
+          editParseMode === 'HTML' ? mdToHtml(args.text as string) : (args.text as string)
         const edited = await bot.api.editMessageText(
           args.chat_id as string,
           Number(args.message_id),
-          args.text as string,
+          editText,
           ...(editParseMode ? [{ parse_mode: editParseMode }] : []),
         )
         const id = typeof edited === 'object' ? edited.message_id : args.message_id
