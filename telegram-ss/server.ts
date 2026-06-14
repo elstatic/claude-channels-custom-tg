@@ -141,6 +141,29 @@ const bot = new Bot(TOKEN)
   })
 }
 
+// Bot API 10.1 (June 2026) added Rich Messages — native headers/tables/nested &
+// task lists/formulas/media via { rich_message: { markdown: <GFM> } }. grammy
+// 1.41.1 predates it, so these methods aren't in its typed api; call them over
+// raw HTTP. fetch honours HTTP(S)_PROXY from env, same as grammy's client. We
+// mirror the thread-id auto-injection above for the send variants (edit targets
+// a message_id and takes no thread id). Throws on a non-ok response so callers
+// can fall back to the legacy HTML/plain paths.
+const RICH_THREAD_METHODS = new Set(['sendRichMessage', 'sendRichMessageDraft'])
+async function callApi(method: string, payload: Record<string, unknown>): Promise<any> {
+  if (THREAD_ID && RICH_THREAD_METHODS.has(method) && !('message_thread_id' in payload)) {
+    payload = { ...payload, message_thread_id: THREAD_ID }
+  }
+  const res = await fetch(`https://api.telegram.org/bot${TOKEN}/${method}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
+  })
+  const json: any = await res.json()
+  if (!json.ok) throw new Error(`${method} failed: ${json.error_code} ${json.description}`)
+  return json.result
+}
+
 type PendingEntry = {
   senderId: string
   chatId: string
@@ -493,7 +516,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           format: {
             type: 'string',
             enum: ['markdown', 'text', 'markdownv2'],
-            description: "Rendering mode. DEFAULT 'markdown': just write normal GitHub-flavoured Markdown (headers, **bold**, *italic*, ~~strike~~, ||spoiler||, `code`, fenced ```code``` blocks, [links](url), > quotes, bulleted/nested lists, GFM tables, ![images](url)) — the bridge renders it to Telegram's HTML subset and escapes for you, so NO manual escaping and a render glitch falls back to plain text instead of dropping. 'text' = raw plain (opt out of formatting). 'markdownv2' = passthrough for callers who already hand-escaped MarkdownV2.",
+            description: "Rendering mode. DEFAULT 'markdown': just write normal GitHub-flavoured Markdown — it's sent as a native Telegram Rich Message (Bot API 10.1) with REAL headers, **bold**, *italic*, ~~strike~~, `code`, fenced ```code``` blocks (with language), [links](url), > quotes, bulleted/numbered/nested lists, task lists, GFM tables, dividers, and math. No manual escaping; up to ~30k chars per message; if the API ever rejects it the bridge degrades to HTML then plain text so nothing is dropped. 'text' = raw plain (opt out of formatting). 'markdownv2' = passthrough for callers who already hand-escaped MarkdownV2.",
           },
           silent: {
             type: 'boolean',
@@ -539,7 +562,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           format: {
             type: 'string',
             enum: ['text', 'markdown', 'markdownv2'],
-            description: "Rendering mode. 'markdown' — normal GitHub-flavoured Markdown, converted to Telegram HTML by the bridge (no manual escaping). 'markdownv2' — raw MarkdownV2, caller must hand-escape. 'text' (default) — plain. (Default is plain here because interim edits are usually short status pings; pass 'markdown' when editing in rich content.)",
+            description: "Rendering mode. 'markdown' — normal GitHub-flavoured Markdown, edited in as a native Rich Message (no manual escaping). 'markdownv2' — raw MarkdownV2, caller must hand-escape. 'text' (default) — plain. (Default is plain here because interim edits are usually short status pings; pass 'markdown' when editing in rich content.)",
           },
         },
         required: ['chat_id', 'message_id', 'text'],
@@ -692,13 +715,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const text = args.text as string
         const reply_to = args.reply_to != null ? Number(args.reply_to) : undefined
         const files = (args.files as string[] | undefined) ?? []
-        // Default renders the agent's Markdown to Telegram HTML. 'text' = raw
-        // plain (opt out); 'markdownv2' = passthrough for pre-escaped callers.
+        // Default sends the agent's Markdown as a native Rich Message (Bot API
+        // 10.1): real headers/tables/nested & task lists/formulas. 'text' = raw
+        // plain (opt out); 'markdownv2' = legacy MarkdownV2 passthrough.
         const format = (args.format as string | undefined) ?? 'markdown'
-        const parseMode =
-          format === 'markdownv2' ? 'MarkdownV2' as const
-          : format === 'text' ? undefined
-          : 'HTML' as const
+        const isRich = format !== 'text' && format !== 'markdownv2'
+        const legacyParseMode = format === 'markdownv2' ? 'MarkdownV2' as const : undefined
         const silent = args.silent === true
 
         assertAllowedChat(chat_id)
@@ -715,17 +737,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
         const access = loadAccess()
         const rawLimit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
-        // HTML conversion inflates length with tags; chunk the source markdown a
-        // bit shorter so the rendered message stays under Telegram's 4096 cap.
-        const limit = parseMode === 'HTML' ? Math.min(rawLimit, 3500) : rawLimit
         const mode = access.chunkMode ?? 'length'
         const replyMode = access.replyToMode ?? 'first'
-        // markdown mode: split the RAW markdown fence/table-aware so a chunk never
-        // cuts a ``` block or table, then render each chunk to HTML on its own
-        // (balanced tags never span messages). Other modes chunk the text as-is.
-        const chunks = parseMode === 'HTML'
-          ? chunkMarkdown(text, limit)
-          : chunk(text, limit, mode)
+        // Rich Messages accept ~30k chars (probed: 30k OK, 60k rejected), so chunk
+        // fence/table-aware at a generous 20k — most answers fit in one. Legacy
+        // text/markdownv2 stay on the 4096 cap.
+        const RICH_LIMIT = 20000
+        const chunks = isRich
+          ? chunkMarkdown(text, RICH_LIMIT)
+          : chunk(text, rawLimit, mode)
         const sentIds: number[] = []
 
         // If the dispatcher posted an in-topic "💬 работаю…" status message,
@@ -769,44 +789,79 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
               reply_to != null &&
               replyMode !== 'off' &&
               (replyMode === 'all' || i === 0)
-            // Render this chunk (markdown→HTML) and add the tap-to-copy topic-id
-            // footer on the LAST chunk only (one per answer).
-            const body = parseMode === 'HTML' ? mdToHtml(chunks[i] as string) : (chunks[i] as string)
+
+            if (isRich) {
+              // Rich path: send the agent's Markdown verbatim (GFM). Tap-to-copy
+              // topic-id footer (inline code) on the LAST chunk only.
+              const md = isLast && THREAD_ID
+                ? `${chunks[i]}\n\n🧵 \`${THREAD_ID}\``
+                : (chunks[i] as string)
+              // Morph the dispatcher's working bubble into the first chunk.
+              if (i === 0 && statusMsgId != null) {
+                try {
+                  await callApi('editMessageText', {
+                    chat_id, message_id: statusMsgId,
+                    rich_message: { markdown: md },
+                    reply_markup: { inline_keyboard: [] },
+                  })
+                  sentIds.push(statusMsgId)
+                  continue
+                } catch {
+                  // Bubble gone/uneditable, or rich rejected — fall through to a
+                  // fresh send (which has its own fallback chain).
+                }
+              }
+              try {
+                const sent = await callApi('sendRichMessage', {
+                  chat_id,
+                  rich_message: { markdown: md },
+                  ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
+                  ...(silent ? { disable_notification: true } : {}),
+                })
+                sentIds.push(sent.message_id)
+              } catch {
+                // Rich rejected (older Bot API / edge) → degrade to the legacy
+                // HTML render; if THAT fails → plain hard-split. Never drop.
+                try {
+                  const html = mdToHtml(chunks[i] as string) +
+                    (isLast && THREAD_ID ? `\n\n🧵 <code>${THREAD_ID}</code>` : '')
+                  const sent = await bot.api.sendMessage(chat_id, html, {
+                    parse_mode: 'HTML',
+                    ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
+                    ...(silent ? { disable_notification: true } : {}),
+                  } as any, AbortSignal.timeout(SEND_TIMEOUT_MS))
+                  sentIds.push(sent.message_id)
+                } catch {
+                  await sendPlainFallback(chunks[i] as string, isLast, shouldReplyTo)
+                }
+              }
+              continue
+            }
+
+            // Legacy path: 'text' (plain) or 'markdownv2' (pre-escaped passthrough).
             const tagged = isLast
-              ? withTopicTag(body, parseMode)
-              : { text: body, entities: undefined as any[] | undefined }
+              ? withTopicTag(chunks[i] as string, legacyParseMode)
+              : { text: chunks[i] as string, entities: undefined as any[] | undefined }
             if (i === 0 && statusMsgId != null) {
               try {
                 await bot.api.editMessageText(chat_id, statusMsgId, tagged.text, {
-                  ...(parseMode ? { parse_mode: parseMode } : {}),
+                  ...(legacyParseMode ? { parse_mode: legacyParseMode } : {}),
                   ...(tagged.entities ? { entities: tagged.entities } : {}),
-                  // Drop the ⏹ Стоп button — the bubble is now the final answer.
                   reply_markup: { inline_keyboard: [] },
                 } as any)
                 sentIds.push(statusMsgId)
                 continue
               } catch {
-                // Status message gone/uneditable, or HTML rejected — fall through
-                // to a normal send (which itself has the plain fallback below).
+                // Status message gone/uneditable — fall through to a normal send.
               }
             }
-            try {
-              const sent = await bot.api.sendMessage(chat_id, tagged.text, {
-                ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
-                ...(parseMode ? { parse_mode: parseMode } : {}),
-                ...(tagged.entities ? { entities: tagged.entities } : {}),
-                ...(silent ? { disable_notification: true } : {}),
-              } as any, AbortSignal.timeout(SEND_TIMEOUT_MS))
-              sentIds.push(sent.message_id)
-            } catch (sendErr) {
-              // Only HTML mode can fail on a malformed entity we can recover from
-              // by dropping to plain text; other modes surface the error.
-              if (parseMode === 'HTML') {
-                await sendPlainFallback(chunks[i] as string, isLast, shouldReplyTo)
-              } else {
-                throw sendErr
-              }
-            }
+            const sent = await bot.api.sendMessage(chat_id, tagged.text, {
+              ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
+              ...(legacyParseMode ? { parse_mode: legacyParseMode } : {}),
+              ...(tagged.entities ? { entities: tagged.entities } : {}),
+              ...(silent ? { disable_notification: true } : {}),
+            } as any, AbortSignal.timeout(SEND_TIMEOUT_MS))
+            sentIds.push(sent.message_id)
           }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err)
@@ -889,16 +944,32 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       case 'edit_message': {
         assertAllowedChat(args.chat_id as string)
         const editFormat = (args.format as string | undefined) ?? 'text'
-        const editParseMode =
-          editFormat === 'markdownv2' ? 'MarkdownV2' as const
-          : editFormat === 'markdown' ? 'HTML' as const
-          : undefined
-        const editText =
-          editParseMode === 'HTML' ? mdToHtml(args.text as string) : (args.text as string)
+        if (editFormat === 'markdown') {
+          // Native Rich Message edit (Bot API 10.1); degrade to legacy HTML if
+          // the API rejects it so the edit still lands.
+          try {
+            const r = await callApi('editMessageText', {
+              chat_id: args.chat_id as string,
+              message_id: Number(args.message_id),
+              rich_message: { markdown: args.text as string },
+            })
+            return { content: [{ type: 'text', text: `edited (id: ${r.message_id})` }] }
+          } catch {
+            const edited = await bot.api.editMessageText(
+              args.chat_id as string,
+              Number(args.message_id),
+              mdToHtml(args.text as string),
+              { parse_mode: 'HTML' } as any,
+            )
+            const id = typeof edited === 'object' ? edited.message_id : args.message_id
+            return { content: [{ type: 'text', text: `edited (id: ${id})` }] }
+          }
+        }
+        const editParseMode = editFormat === 'markdownv2' ? 'MarkdownV2' as const : undefined
         const edited = await bot.api.editMessageText(
           args.chat_id as string,
           Number(args.message_id),
-          editText,
+          args.text as string,
           ...(editParseMode ? [{ parse_mode: editParseMode }] : []),
         )
         const id = typeof edited === 'object' ? edited.message_id : args.message_id
